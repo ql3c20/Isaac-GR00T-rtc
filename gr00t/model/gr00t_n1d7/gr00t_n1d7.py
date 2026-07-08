@@ -234,6 +234,37 @@ class Gr00tN1d7ActionHead(nn.Module):
         noisy_trajectory = (1 - t) * noise + t * actions
         velocity = actions - noise
 
+        # Training-time RTC / inpainting augmentation.
+        #
+        # Psi0's RTC-trained models see a random clean prefix during training and
+        # are only optimized on the suffix.  Mirror that distribution here so a
+        # GR00T policy can later use inference-time RTC where an unexecuted tail
+        # from the previous chunk seeds the next chunk.
+        rtc_prefix_mask = None
+        if self.training and getattr(self.config, "train_rtc", False):
+            min_delay = int(getattr(self.config, "train_rtc_min_delay", 0))
+            max_delay = int(getattr(self.config, "train_rtc_max_delay", 8))
+            min_delay = max(0, min(min_delay, actions.shape[1]))
+            max_delay = max(0, min(max_delay, actions.shape[1]))
+            if max_delay > min_delay:
+                delays = torch.randint(
+                    low=min_delay,
+                    high=max_delay,
+                    size=(actions.shape[0],),
+                    device=actions.device,
+                    dtype=torch.long,
+                )
+                rtc_prefix_mask = (
+                    torch.arange(actions.shape[1], device=actions.device)[None, :]
+                    < delays[:, None]
+                )
+                # Expose the clean prefix as the known/conditioned part.
+                noisy_trajectory = torch.where(
+                    rtc_prefix_mask[:, :, None],
+                    actions,
+                    noisy_trajectory,
+                )
+
         # Convert (continuous) t -> discrete if needed
         t_discretized = (t[:, 0, 0] * self.num_timestep_buckets).long()
         action_features = self.action_encoder(noisy_trajectory, t_discretized, embodiment_id)
@@ -274,6 +305,8 @@ class Gr00tN1d7ActionHead(nn.Module):
 
         # Slice out only the action portion of pred and target.
         action_mask = action_input.action_mask
+        if rtc_prefix_mask is not None:
+            action_mask = action_mask * (~rtc_prefix_mask)[:, :, None].to(dtype=action_mask.dtype)
         action_loss = F.mse_loss(pred_actions, velocity, reduction="none") * action_mask
         loss = action_loss.sum() / (action_mask.sum() + 1e-6)
 

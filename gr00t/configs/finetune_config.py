@@ -63,6 +63,19 @@ class FinetuneConfig:
     Dropout probability applied to state inputs for regularization during training.
     """
 
+    train_rtc: bool = False
+    """
+    Enable training-time RTC/inpainting augmentation for the action head.  A random
+    clean action prefix is inserted and masked out of the loss, matching
+    inference-time receding horizon chunking.
+    """
+
+    train_rtc_min_delay: int = 0
+    """Minimum number of clean prefix frames used when train_rtc=True."""
+
+    train_rtc_max_delay: int = 8
+    """Maximum exclusive number of clean prefix frames used when train_rtc=True."""
+
     # --- Data Augmentation ---
     random_rotation_angle: int | None = None
     """Maximum rotation angle (in degrees) for random rotation augmentation of input images."""

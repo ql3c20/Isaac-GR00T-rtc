@@ -12,6 +12,9 @@ GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-32}"
 SHARD_SIZE="${SHARD_SIZE:-1024}"
 NUM_SHARDS_PER_EPOCH="${NUM_SHARDS_PER_EPOCH:-100000}"
 EPISODE_SAMPLING_RATE="${EPISODE_SAMPLING_RATE:-0.1}"
+TRAIN_RTC="${TRAIN_RTC:-0}"
+TRAIN_RTC_MIN_DELAY="${TRAIN_RTC_MIN_DELAY:-0}"
+TRAIN_RTC_MAX_DELAY="${TRAIN_RTC_MAX_DELAY:-8}"
 
 BASE_MODEL_PATH=""
 DATASET_PATH=""
@@ -144,6 +147,13 @@ fi
 
 if [ -n "$STATE_DROPOUT_PROB" ]; then
     LAUNCH_CMD+=(--state_dropout_prob "$STATE_DROPOUT_PROB")
+fi
+if [ "$TRAIN_RTC" = "1" ]; then
+    LAUNCH_CMD+=(
+        --train_rtc
+        --train_rtc_min_delay "$TRAIN_RTC_MIN_DELAY"
+        --train_rtc_max_delay "$TRAIN_RTC_MAX_DELAY"
+    )
 fi
 if [ -n "${SAVE_ONLY_MODEL:-}" ]; then
     LAUNCH_CMD+=(--save_only_model)

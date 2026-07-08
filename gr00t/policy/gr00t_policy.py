@@ -403,9 +403,33 @@ class Gr00tPolicy(BasePolicy):
         collated_inputs = self.collate_fn(processed_inputs)
         collated_inputs = _rec_to_dtype(collated_inputs, dtype=torch.bfloat16)
 
+        # Step 3b: Real-Time Chunking (RTC) inpainting.
+        # When the caller supplies the previous *normalized* action chunk plus RTC
+        # parameters, seed the flow-matching sampler with that chunk so the new
+        # prediction stays continuous with the unexecuted tail of the previous one
+        # (see Gr00tN1d7ActionHead.get_action_with_features).  The action head
+        # expects action_input["action"] in the model's internal normalized/padded
+        # action space, i.e. exactly the tensor previously returned as
+        # model_pred["action_pred"].
+        model_options: dict[str, Any] | None = None
+        if options is not None and options.get("rtc_prev_action") is not None:
+            prev_action = torch.as_tensor(
+                np.asarray(options["rtc_prev_action"], dtype=np.float32)
+            )
+            if prev_action.ndim == 2:
+                prev_action = prev_action.unsqueeze(0)  # (T, D) -> (1, T, D)
+            prev_action = prev_action.to(device=self.model.device, dtype=torch.bfloat16)
+            collated_inputs["inputs"]["action"] = prev_action
+            model_options = {
+                "action_horizon": int(options.get("action_horizon", prev_action.shape[1])),
+                "rtc_overlap_steps": int(options["rtc_overlap_steps"]),
+                "rtc_frozen_steps": int(options["rtc_frozen_steps"]),
+                "rtc_ramp_rate": float(options["rtc_ramp_rate"]),
+            }
+
         # Step 4: Run model inference to predict actions
         with torch.inference_mode():
-            model_pred = self.model.get_action(**collated_inputs)
+            model_pred = self.model.get_action(**collated_inputs, options=model_options)
         normalized_action = model_pred["action_pred"].float()
 
         # Step 5: Decode actions from normalized space back to physical units
@@ -420,7 +444,10 @@ class Gr00tPolicy(BasePolicy):
         casted_action = {
             key: value.astype(np.float32) for key, value in unnormalized_action.items()
         }
-        return casted_action, {}
+        # Expose the raw normalized prediction so RTC callers can retain it as the
+        # continuity prefix for the next chunk.
+        info = {"normalized_action_pred": normalized_action.detach().cpu().numpy()}
+        return casted_action, info
 
     def check_action(self, action: dict[str, Any]) -> None:
         """Validate that the action has the correct structure and types.
