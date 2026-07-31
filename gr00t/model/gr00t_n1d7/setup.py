@@ -125,6 +125,37 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 transformers_loading_kwargs=self.transformers_loading_kwargs,
             )
 
+        # from_pretrained loads checkpoint config; CLI RTC flags live on
+        # self.config.model and must be copied onto the live HF model.config
+        # (action_head reads getattr(self.config, "train_rtc", ...)).
+        model.config.train_rtc = bool(getattr(self.config.model, "train_rtc", False))
+        model.config.train_rtc_min_delay = int(
+            getattr(self.config.model, "train_rtc_min_delay", 0)
+        )
+        model.config.train_rtc_max_delay = int(
+            getattr(self.config.model, "train_rtc_max_delay", 8)
+        )
+        model.config.train_prefix_rtc = bool(
+            getattr(self.config.model, "train_prefix_rtc", False)
+        )
+        model.config.prefix_rtc_timestep_mode = str(
+            getattr(self.config.model, "prefix_rtc_timestep_mode", "legacy_zero")
+        )
+        if model.config.train_prefix_rtc and not model.config.train_rtc:
+            model.config.train_rtc = True
+        logging.info(
+            "RTC training flags on model.config: train_rtc=%s min_delay=%s "
+            "max_delay=%s train_prefix_rtc=%s prefix_rtc_timestep_mode=%s",
+            model.config.train_rtc,
+            model.config.train_rtc_min_delay,
+            model.config.train_rtc_max_delay,
+            model.config.train_prefix_rtc,
+            model.config.prefix_rtc_timestep_mode,
+        )
+
+        if model.config.train_prefix_rtc:
+            self._apply_prefix_rtc_train_hook(model)
+
         logging.debug(f"Model Config: {model.config}")
         with run_or_wait_on_rank0(label="final_model_config.json write") as is_rank0:
             if is_rank0:
@@ -140,6 +171,60 @@ class Gr00tN1d7Pipeline(ModelPipeline):
         logging.debug(f"Model architecture: {model}")
 
         return model
+
+    @staticmethod
+    def _apply_prefix_rtc_train_hook(model) -> None:
+        """Monkeypatch action head for Psi0-style prefix-RTC training.
+
+        Adapter lives in Psi0 (``scripts/deploy/gr00t_n17_prefix_rtc.py``). Resolve
+        via ``PYTHONPATH`` / ``GR00T_PREFIX_RTC_MODULE`` / default Psi0 path.
+        """
+        import importlib
+        import importlib.util
+        import os
+        from pathlib import Path
+
+        module = None
+        env_path = os.environ.get("GR00T_PREFIX_RTC_MODULE", "").strip()
+        if env_path:
+            path = Path(env_path)
+            if not path.is_file():
+                raise FileNotFoundError(
+                    f"GR00T_PREFIX_RTC_MODULE does not exist: {path}"
+                )
+            spec = importlib.util.spec_from_file_location(
+                "gr00t_n17_prefix_rtc", path
+            )
+            if spec is None or spec.loader is None:
+                raise RuntimeError(f"Could not load prefix-rtc module from {path}")
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+        else:
+            try:
+                module = importlib.import_module("gr00t_n17_prefix_rtc")
+            except ImportError:
+                default = Path(
+                    os.environ.get(
+                        "PSI0_ROOT",
+                        "/pfs/pfs-oHNwH0/mnt/pfs/humanoid/yzh/Psi0",
+                    )
+                ) / "scripts" / "deploy" / "gr00t_n17_prefix_rtc.py"
+                if not default.is_file():
+                    raise ImportError(
+                        "train_prefix_rtc=True but gr00t_n17_prefix_rtc is not "
+                        "importable. Set PYTHONPATH to Psi0/scripts/deploy, or "
+                        f"GR00T_PREFIX_RTC_MODULE / PSI0_ROOT. Tried: {default}"
+                    ) from None
+                spec = importlib.util.spec_from_file_location(
+                    "gr00t_n17_prefix_rtc", default
+                )
+                if spec is None or spec.loader is None:
+                    raise RuntimeError(f"Could not load prefix-rtc module from {default}")
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+
+        module.apply_prefix_rtc_train(model.action_head)
+        logging.info("Applied apply_prefix_rtc_train to action_head")
 
     def _get_statistics(
         self,

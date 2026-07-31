@@ -76,6 +76,22 @@ class FinetuneConfig:
     train_rtc_max_delay: int = 8
     """Maximum exclusive number of clean prefix frames used when train_rtc=True."""
 
+    train_prefix_rtc: bool = False
+    """
+    Enable Psi0-style prefix-RTC training (implies train_rtc): clean prefix +
+    loss mask, plus per-frame timestep conditioning in the action encoder and
+    DiT per-token AdaLN.
+    Applied via Psi0 ``gr00t_n17_prefix_rtc.apply_prefix_rtc_train`` after model load.
+    """
+
+    prefix_rtc_timestep_mode: str = "legacy_zero"
+    """
+    Prefix timestep convention for train_prefix_rtc. ``legacy_zero`` preserves
+    existing checkpoints; ``groot_clean`` uses bucket 999 for GR00T's t=1
+    clean-data endpoint. The value is saved in the checkpoint config so
+    inference can select the matching convention automatically.
+    """
+
     # --- Data Augmentation ---
     random_rotation_angle: int | None = None
     """Maximum rotation angle (in degrees) for random rotation augmentation of input images."""

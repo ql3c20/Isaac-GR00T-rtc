@@ -126,6 +126,7 @@ def build_processor(model_name: str, transformers_loading_kwargs: dict) -> Qwen3
             "Qwen3VLProcessor is not available. "
             "Please upgrade transformers: pip install transformers>=4.52.0"
         )
+    model_name = os.environ.get("GR00T_BACKBONE_PATH", model_name)
     return Qwen3VLProcessor.from_pretrained(model_name, **transformers_loading_kwargs)
 
 

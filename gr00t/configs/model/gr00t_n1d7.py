@@ -117,6 +117,12 @@ class Gr00tN1d7Config(PretrainedConfig):
     train_rtc: bool = False
     train_rtc_min_delay: int = 0
     train_rtc_max_delay: int = 8
+    # Prefix-RTC training (per-frame timestep + token AdaLN). When True,
+    # finetune applies gr00t_n17_prefix_rtc.apply_prefix_rtc_train after load.
+    train_prefix_rtc: bool = False
+    # Existing checkpoints used prefix bucket 0. New GR00T-aligned checkpoints
+    # should use "groot_clean" (last bucket, corresponding to normalized t=1).
+    prefix_rtc_timestep_mode: str = "legacy_zero"
 
     # Training parameters
     tune_projector: bool = True

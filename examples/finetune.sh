@@ -15,6 +15,14 @@ EPISODE_SAMPLING_RATE="${EPISODE_SAMPLING_RATE:-0.1}"
 TRAIN_RTC="${TRAIN_RTC:-0}"
 TRAIN_RTC_MIN_DELAY="${TRAIN_RTC_MIN_DELAY:-0}"
 TRAIN_RTC_MAX_DELAY="${TRAIN_RTC_MAX_DELAY:-8}"
+# Prefix-RTC training. Existing checkpoints use legacy_zero; new GR00T-aligned
+# runs should set GR00T_PREFIX_RTC_TIMESTEP_MODE=groot_clean.
+TRAIN_PREFIX_RTC="${TRAIN_PREFIX_RTC:-0}"
+GR00T_PREFIX_RTC_TIMESTEP_MODE="${GR00T_PREFIX_RTC_TIMESTEP_MODE:-legacy_zero}"
+GR00T_BACKBONE_PATH="${GR00T_BACKBONE_PATH:-/pfs/pfs-oHNwH0/mnt/pfs/humanoid/yzh/Psi0/huggingface/hub/models--nvidia--Cosmos-Reason2-2B/snapshots/9ce19a195e423419c349abfc86fd07178b230561}"
+export GR00T_BACKBONE_PATH
+GR00T_PREFIX_RTC_MODULE="${GR00T_PREFIX_RTC_MODULE:-/pfs/pfs-oHNwH0/mnt/pfs/humanoid/yzh/Psi0/scripts/deploy/gr00t_n17_prefix_rtc.py}"
+export GR00T_PREFIX_RTC_MODULE
 
 BASE_MODEL_PATH=""
 DATASET_PATH=""
@@ -108,6 +116,15 @@ for required_var in BASE_MODEL_PATH DATASET_PATH EMBODIMENT_TAG OUTPUT_DIR; do
     fi
 done
 
+if [ ! -r "$GR00T_BACKBONE_PATH/config.json" ] || [ ! -r "$GR00T_BACKBONE_PATH/model.safetensors" ]; then
+    echo "Cosmos backbone is incomplete or unreadable: ${GR00T_BACKBONE_PATH}" >&2
+    exit 1
+fi
+if [ "$TRAIN_PREFIX_RTC" = "1" ] && [ ! -r "$GR00T_PREFIX_RTC_MODULE" ]; then
+    echo "Prefix-RTC module is unreadable: ${GR00T_PREFIX_RTC_MODULE}" >&2
+    exit 1
+fi
+
 WANDB_FLAG=()
 if [ "$USE_WANDB" = "1" ]; then
     WANDB_FLAG+=(--use_wandb)
@@ -148,7 +165,16 @@ fi
 if [ -n "$STATE_DROPOUT_PROB" ]; then
     LAUNCH_CMD+=(--state_dropout_prob "$STATE_DROPOUT_PROB")
 fi
-if [ "$TRAIN_RTC" = "1" ]; then
+if [ "$TRAIN_PREFIX_RTC" = "1" ]; then
+    # Implies clean-prefix RTC + applies apply_prefix_rtc_train after model load.
+    LAUNCH_CMD+=(
+        --train_prefix_rtc
+        --prefix_rtc_timestep_mode "$GR00T_PREFIX_RTC_TIMESTEP_MODE"
+        --train_rtc
+        --train_rtc_min_delay "$TRAIN_RTC_MIN_DELAY"
+        --train_rtc_max_delay "$TRAIN_RTC_MAX_DELAY"
+    )
+elif [ "$TRAIN_RTC" = "1" ]; then
     LAUNCH_CMD+=(
         --train_rtc
         --train_rtc_min_delay "$TRAIN_RTC_MIN_DELAY"

@@ -80,7 +80,10 @@ if __name__ == "__main__":
     config.model.tune_projector = ft_config.tune_projector
     config.model.tune_diffusion_model = ft_config.tune_diffusion_model
     config.model.state_dropout_prob = ft_config.state_dropout_prob
-    config.model.train_rtc = ft_config.train_rtc
+    # Prefix-RTC training implies clean-prefix RTC augmentation.
+    config.model.train_prefix_rtc = bool(ft_config.train_prefix_rtc)
+    config.model.prefix_rtc_timestep_mode = str(ft_config.prefix_rtc_timestep_mode)
+    config.model.train_rtc = bool(ft_config.train_rtc) or config.model.train_prefix_rtc
     config.model.train_rtc_min_delay = ft_config.train_rtc_min_delay
     config.model.train_rtc_max_delay = ft_config.train_rtc_max_delay
     config.model.random_rotation_angle = ft_config.random_rotation_angle

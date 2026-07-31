@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import logging
+import os
 
 import torch
 from transformers.feature_extraction_utils import BatchFeature
@@ -131,6 +132,11 @@ class Qwen3Backbone(torch.nn.Module):
             )
 
         super().__init__()
+
+        # GR00T checkpoints store the original Hub model id in config.json.
+        # Allow deployment to resolve that dependency to a fully downloaded
+        # local snapshot so inference does not require Hub metadata access.
+        model_name = os.environ.get("GR00T_BACKBONE_PATH", model_name)
 
         # Add attention kwargs
         extra_kwargs = {}
