@@ -34,6 +34,13 @@ Usage:
         --dataset-path demo_data/libero_demo \
         --steps export,build
 
+    # Backbone-only first stage (ViT + LLM TRT, action head stays PyTorch)
+    python scripts/deployment/build_trt_pipeline.py \
+        --model-path checkpoints/GR00T-N1.7-LIBERO/libero_10 \
+        --dataset-path demo_data/libero_demo \
+        --export-mode vit_llm_only \
+        --steps export,build,verify
+
     # Skip benchmark
     python scripts/deployment/build_trt_pipeline.py \
         --model-path checkpoints/GR00T-N1.7-LIBERO/libero_10 \
@@ -83,6 +90,7 @@ VALID_STEPS = tuple(Step)
 
 # Mapping from export_mode -> (build mode, verify mode, benchmark trt_mode)
 _MODE_MAP = {
+    "vit_llm_only": ("vit_llm_only", "vit_llm_only", "vit_llm_only"),
     "full_pipeline": ("full_pipeline", "n17_full_pipeline", "n17_full_pipeline"),
     "action_head": ("full_pipeline", "action_head", "dit_only"),
     "dit_only": ("single", "action_head", "dit_only"),
@@ -219,6 +227,9 @@ class PipelineConfig:
     embodiment_tag: Optional[str] = None
     """Embodiment tag. Auto-detected from processor_config.json if not provided."""
 
+    modality_config_path: Optional[str] = None
+    """Optional Python file that registers a custom embodiment modality config."""
+
     output_dir: str = "./gr00t_trt_deployment"
     """Root output directory. ONNX files go to <output_dir>/onnx/, engines to <output_dir>/engines/."""
 
@@ -247,7 +258,7 @@ class PipelineConfig:
 
     # -- Export options ------------------------------------------------------
     export_mode: ExportMode = ExportMode.full_pipeline
-    """Export mode: 'dit_only', 'action_head', or 'full_pipeline' (recommended)."""
+    """Export mode: 'vit_llm_only', 'dit_only', 'action_head', or 'full_pipeline'."""
 
     # -- Build options ------------------------------------------------------
     workspace: int = 8192
@@ -283,6 +294,7 @@ def _run_export(cfg: PipelineConfig, onnx_dir: str, embodiment_tag, log_fp) -> N
         model_path=cfg.model_path,
         dataset_path=cfg.dataset_path,
         embodiment_tag=embodiment_tag,
+        modality_config_path=cfg.modality_config_path,
         output_dir=onnx_dir,
         export_mode=cfg.export_mode,
         precision=cfg.precision,
@@ -297,7 +309,8 @@ def _run_build(
 ) -> None:
     from build_tensorrt_engine import BuildConfig, main as build_main
 
-    build_mode, _, _ = _MODE_MAP[cfg.export_mode]
+    export_mode = str(cfg.export_mode)
+    build_mode, _, _ = _MODE_MAP[export_mode]
 
     if build_mode == "single":
         # dit_only: single ONNX -> single engine
@@ -308,9 +321,17 @@ def _run_build(
             precision=cfg.precision,
             workspace=cfg.workspace,
         )
-    else:
+    elif build_mode == "full_pipeline":
         build_cfg = BuildConfig(
             mode="full_pipeline",
+            onnx_dir=onnx_dir,
+            engine_dir=engine_dir,
+            precision=cfg.precision,
+            workspace=cfg.workspace,
+        )
+    else:
+        build_cfg = BuildConfig(
+            mode=build_mode,
             onnx_dir=onnx_dir,
             engine_dir=engine_dir,
             precision=cfg.precision,
@@ -323,13 +344,15 @@ def _run_build(
 def _run_verify(cfg: PipelineConfig, engine_dir: str, embodiment_tag, log_fp) -> float:
     from verify_n1d7_trt import VerifyConfig, main as verify_main
 
-    _, verify_mode, _ = _MODE_MAP[cfg.export_mode]
+    export_mode = str(cfg.export_mode)
+    _, verify_mode, _ = _MODE_MAP[export_mode]
     verify_cfg = VerifyConfig(
         model_path=cfg.model_path,
         dataset_path=cfg.dataset_path,
         engine_dir=engine_dir,
         mode=verify_mode,
         embodiment_tag=embodiment_tag,
+        modality_config_path=cfg.modality_config_path,
         batch_size=cfg.batch_size,
     )
     with _redirect_to_log(log_fp, tee=True):
@@ -340,10 +363,11 @@ def _run_verify(cfg: PipelineConfig, engine_dir: str, embodiment_tag, log_fp) ->
 def _run_benchmark(cfg: PipelineConfig, engine_dir: str, embodiment_tag, log_fp) -> None:
     from benchmark_inference import BenchmarkConfig, main as benchmark_main
 
-    _, _, trt_mode = _MODE_MAP[cfg.export_mode]
+    export_mode = str(cfg.export_mode)
+    _, _, trt_mode = _MODE_MAP[export_mode]
 
     # For dit_only, engine path is the single .engine file
-    if cfg.export_mode == "dit_only":
+    if export_mode == "dit_only":
         trt_engine_path = os.path.join(engine_dir, "dit_bf16.engine")
     else:
         trt_engine_path = engine_dir
@@ -352,6 +376,7 @@ def _run_benchmark(cfg: PipelineConfig, engine_dir: str, embodiment_tag, log_fp)
         model_path=cfg.model_path,
         dataset_path=cfg.dataset_path,
         embodiment_tag=embodiment_tag.value,
+        modality_config_path=cfg.modality_config_path,
         trt_engine_path=trt_engine_path,
         trt_mode=trt_mode,
         num_iterations=cfg.num_iterations,
@@ -432,6 +457,7 @@ def main(cfg: PipelineConfig | None = None) -> None:
         print(f"  Model:        {cfg.model_path}")
         print(f"  Dataset:      {cfg.dataset_path}")
         print(f"  Embodiment:   {embodiment_tag}")
+        print(f"  Modality cfg: {cfg.modality_config_path or 'checkpoint/default'}")
         print(f"  Export mode:  {cfg.export_mode}")
         print(f"  Batch size:   {cfg.batch_size}")
         print(f"  Precision:    {cfg.precision}")

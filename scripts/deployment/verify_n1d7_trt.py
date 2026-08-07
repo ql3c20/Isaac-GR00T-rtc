@@ -34,6 +34,7 @@ from gr00t.data.dataset.lerobot_episode_loader import LeRobotEpisodeLoader
 from gr00t.data.embodiment_tags import EmbodimentTag
 from gr00t.deployment.modes import VerifyMode
 from gr00t.policy.gr00t_policy import Gr00tPolicy
+from modality_config_utils import import_modality_config
 
 
 @dataclass
@@ -55,8 +56,17 @@ class VerifyConfig:
     embodiment_tag: EmbodimentTag = EmbodimentTag.LIBERO_PANDA
     """Embodiment tag to use."""
 
+    modality_config_path: str | None = None
+    """Optional Python file that registers a custom embodiment modality config."""
+
     batch_size: int = 1
     """Batch size for TRT inference. If > 1, tiles the observation and takes slice [0] for comparison."""
+
+    traj_idx: int = 0
+    """Trajectory index to sample from the dataset for PyTorch/TRT comparison."""
+
+    step_idx: int = 0
+    """Step index within the selected trajectory for PyTorch/TRT comparison."""
 
 
 def _tile_observation(obs, n):
@@ -89,6 +99,7 @@ def main(args: VerifyConfig | None = None):
 
     # Step 1: Load policy and get PyTorch reference output
     print("\n[1] Loading policy...")
+    import_modality_config(args.modality_config_path)
     policy = Gr00tPolicy(
         embodiment_tag=args.embodiment_tag,
         model_path=args.model_path,
@@ -131,7 +142,7 @@ def main(args: VerifyConfig | None = None):
     )
 
     print("[3] Running PyTorch inference...")
-    obs = prepare_observation(policy, dataset, traj_idx=0)
+    obs = prepare_observation(policy, dataset, traj_idx=args.traj_idx, step_idx=args.step_idx)
     torch.manual_seed(42)
     with torch.inference_mode():
         result = policy.get_action(obs)
@@ -187,7 +198,7 @@ def main(args: VerifyConfig | None = None):
         trt_vit_output = vit_result["image_embeds"][:num_merged].detach().clone()
 
     print("[5] Running TRT inference...")
-    obs2 = prepare_observation(policy, dataset, traj_idx=0)
+    obs2 = prepare_observation(policy, dataset, traj_idx=args.traj_idx, step_idx=args.step_idx)
     if args.batch_size > 1:
         print(f"  Tiling observation to batch_size={args.batch_size}")
         obs2 = _tile_observation(obs2, args.batch_size)

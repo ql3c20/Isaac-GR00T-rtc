@@ -61,6 +61,7 @@ from gr00t.data.embodiment_tags import EmbodimentTag
 from gr00t.data.types import MessageType, VLAStepData
 from gr00t.deployment.modes import BenchmarkMode
 from gr00t.policy.gr00t_policy import Gr00tPolicy
+from modality_config_utils import import_modality_config
 import numpy as np
 import torch
 import tyro
@@ -348,6 +349,9 @@ class BenchmarkConfig:
     embodiment_tag: str = "libero_sim"
     """Embodiment tag to use."""
 
+    modality_config_path: str | None = None
+    """Optional Python file that registers a custom embodiment modality config."""
+
     trt_engine_path: str | None = None
     """Path to TensorRT engine. If not provided, TensorRT benchmark is skipped."""
 
@@ -397,6 +401,7 @@ def main(args: BenchmarkConfig | None = None):
     )
     print(f"Model: {args.model_path}")
     print(f"Dataset: {args.dataset_path}")
+    print(f"Modality config: {args.modality_config_path or 'checkpoint/default'}")
     print(f"Iterations: {args.num_iterations}")
     print(f"Warmup: {args.warmup}")
     print(f"Use Trajectory: {args.use_trajectory}")
@@ -404,6 +409,7 @@ def main(args: BenchmarkConfig | None = None):
 
     # Load dataset and prepare observation
     print("Loading policy...")
+    import_modality_config(args.modality_config_path)
     policy = Gr00tPolicy(
         model_path=args.model_path,
         embodiment_tag=EmbodimentTag.resolve(args.embodiment_tag),

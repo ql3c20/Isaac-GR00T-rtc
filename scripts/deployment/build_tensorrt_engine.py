@@ -18,10 +18,11 @@
 """
 Build TensorRT engines from exported ONNX models.
 
-Supports two modes:
+Supports three modes:
 - single: Build engine for a single ONNX model
+- vit_llm_only: Build only Qwen3-VL ViT + LLM engines
 - full_pipeline: Build engines for all pipeline components
-  (ViT, LLM, State Encoder, Action Encoder, DiT, Action Decoder)
+  (ViT, LLM, VL Self-Attention, State Encoder, Action Encoder, DiT, Action Decoder)
 
 Shape profiles are automatically derived from the ONNX models.
 
@@ -387,7 +388,12 @@ def build_engine(
 
 
 def build_full_pipeline(
-    onnx_dir, engine_dir, precision="bf16", workspace_mb=8192, trt_severity=None
+    onnx_dir,
+    engine_dir,
+    precision="bf16",
+    workspace_mb=8192,
+    trt_severity=None,
+    component_names: set[str] | None = None,
 ):
     """Build all TRT engines for the full pipeline.
 
@@ -399,6 +405,7 @@ def build_full_pipeline(
         engine_dir: Directory to save TRT engines
         precision: Precision mode
         workspace_mb: Workspace size in MB
+        component_names: Optional component-name allowlist.
     """
     os.makedirs(engine_dir, exist_ok=True)
 
@@ -450,6 +457,14 @@ def build_full_pipeline(
         ("DiT", "dit_bf16.onnx", "dit_bf16.engine"),
         ("Action Decoder", "action_decoder.onnx", "action_decoder.engine"),
     ]
+    if component_names is not None:
+        known_names = {name for name, _, _ in components}
+        unknown_names = sorted(component_names - known_names)
+        if unknown_names:
+            raise ValueError(
+                f"Unknown component(s): {unknown_names}. Valid components: {sorted(known_names)}"
+            )
+        components = [item for item in components if item[0] in component_names]
 
     results: list[tuple[str, str, str]] = []
     skipped: list[tuple[str, str]] = []  # (name, onnx_path) for components with no ONNX input
@@ -508,7 +523,10 @@ def build_full_pipeline(
 
     # Print summary
     logger.info("\n" + "=" * 80)
-    logger.info("FULL PIPELINE BUILD SUMMARY")
+    if component_names is None:
+        logger.info("FULL PIPELINE BUILD SUMMARY")
+    else:
+        logger.info("SELECTED PIPELINE BUILD SUMMARY")
     logger.info("=" * 80)
     for name, path, status in results:
         logger.info(f"  {name:20s} -> {status}")
@@ -542,7 +560,7 @@ class BuildConfig:
     """Configuration for building TensorRT engines from ONNX models."""
 
     mode: BuildEngineMode = BuildEngineMode.single
-    """Build mode: 'single' (one engine) or 'full_pipeline' (all engines)."""
+    """Build mode: 'single', 'vit_llm_only' (ViT + LLM), or 'full_pipeline'."""
 
     onnx: str | None = None
     """Path to ONNX model (single mode)."""
@@ -567,13 +585,16 @@ def main(args: BuildConfig | None = None, trt_severity=None):
     if args is None:
         args = tyro.cli(BuildConfig)
 
-    if args.mode == "full_pipeline":
+    build_mode = str(args.mode)
+    if build_mode in ("full_pipeline", "vit_llm_only"):
+        component_names = {"ViT", "LLM"} if build_mode == "vit_llm_only" else None
         build_full_pipeline(
             onnx_dir=args.onnx_dir,
             engine_dir=args.engine_dir,
             precision=args.precision,
             workspace_mb=args.workspace,
             trt_severity=trt_severity,
+            component_names=component_names,
         )
     else:
         if not args.onnx or not args.engine:

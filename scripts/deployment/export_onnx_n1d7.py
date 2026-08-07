@@ -18,9 +18,10 @@
 """
 Export GR00T N1.7 model components to ONNX for TensorRT optimization.
 
-Supports three export modes:
+Supports four export modes:
   - dit_only:      Export only the DiT (backward compatible with N1.6).
   - action_head:   Export 4 action head components (ViT + LLM stay in PyTorch).
+  - vit_llm_only:  Export only ViT + LLM; action head stays in PyTorch.
   - full_pipeline: Export ViT + LLM + 4 action head components. Lightweight
                    glue ops (embed_tokens, masked_scatter, get_rope_index,
                    VLLN) remain in PyTorch. Referred to as 'n17_full_pipeline'
@@ -60,6 +61,7 @@ from gr00t.data.dataset.sharded_single_step_dataset import extract_step_data
 from gr00t.data.embodiment_tags import EmbodimentTag
 from gr00t.deployment.modes import ExportMode
 from gr00t.policy.gr00t_policy import Gr00tPolicy
+from modality_config_utils import import_modality_config
 import numpy as np
 import torch
 import torch.nn as nn
@@ -885,15 +887,15 @@ def parse_observation_gr00t(
     return new_obs
 
 
-def prepare_observation(policy, dataset, traj_idx=0):
+def prepare_observation(policy, dataset, traj_idx=0, step_idx=0):
     """Prepare a single observation for inference."""
-    logger.info(f"\nPreparing observation from trajectory {traj_idx}...")
+    logger.info(f"\nPreparing observation from trajectory {traj_idx}, step {step_idx}...")
 
     traj = dataset[traj_idx]
     modality_configs = policy.get_modality_config()
 
     data_point = extract_step_data(
-        traj, 0, modality_configs=modality_configs, embodiment_tag=policy.embodiment_tag
+        traj, step_idx, modality_configs=modality_configs, embodiment_tag=policy.embodiment_tag
     )
 
     observation = {}
@@ -1259,19 +1261,21 @@ def export_action_decoder_to_onnx(policy, output_dir, use_bf16=True, batch_size=
 
 def main(args):
     args.embodiment_tag = EmbodimentTag.resolve(args.embodiment_tag)
+    export_mode = str(args.export_mode)
     logger.info("=" * 80)
     logger.info("GR00T N1.7 ONNX Export Script")
     logger.info("=" * 80)
     logger.info(f"Model path: {args.model_path}")
     logger.info(f"Dataset path: {args.dataset_path}")
     logger.info(f"Embodiment: {args.embodiment_tag}")
-    logger.info(f"Export mode: {args.export_mode}")
+    logger.info(f"Export mode: {export_mode}")
     logger.info(f"Batch size: {args.batch_size}")
     logger.info(f"Output directory: {args.output_dir}")
     logger.info("=" * 80)
 
     # Step 1: Load the policy
     logger.info("\n[Step 1] Loading policy...")
+    import_modality_config(args.modality_config_path)
     policy = Gr00tPolicy(
         embodiment_tag=args.embodiment_tag,
         model_path=args.model_path,
@@ -1295,12 +1299,13 @@ def main(args):
         dit_capture.hook_fn, with_kwargs=True
     )
 
-    # Also capture ViT and LLM inputs if doing full_pipeline
+    # Also capture ViT and LLM inputs if exporting backbone engines.
     vit_capture = None
     vit_hook = None
     llm_capture = None
     llm_hook = None
-    if args.export_mode == "full_pipeline":
+    export_backbone = export_mode in ("full_pipeline", "vit_llm_only")
+    if export_backbone:
         vit_capture = ViTInputCapture()
         qwen_model = policy.model.backbone.model
         vit_hook = qwen_model.model.visual.register_forward_hook(
@@ -1326,10 +1331,10 @@ def main(args):
     if not dit_capture.captured:
         logger.error("  Failed to capture DiT inputs!")
         return
-    if args.export_mode == "full_pipeline" and not vit_capture.captured:
+    if export_backbone and not vit_capture.captured:
         logger.error("  Failed to capture ViT inputs!")
         return
-    if args.export_mode == "full_pipeline" and not llm_capture.captured:
+    if export_backbone and not llm_capture.captured:
         logger.error("  Failed to capture LLM inputs!")
         return
 
@@ -1373,7 +1378,7 @@ def main(args):
         "input_embedding_dim": int(action_head_config.input_embedding_dim),
         "backbone_embedding_dim": int(action_head_config.backbone_embedding_dim),
         "embodiment_tag": str(args.embodiment_tag),
-        "export_mode": args.export_mode,
+        "export_mode": export_mode,
         "precision": args.precision,
         "batch_size": args.batch_size,
     }
@@ -1385,7 +1390,7 @@ def main(args):
 
     # Step 4: Export
     bs = args.batch_size
-    if args.export_mode == "dit_only":
+    if export_mode == "dit_only":
         logger.info("\n[Step 4] Exporting DiT to ONNX (dit_only mode)...")
         dit_output_path = os.path.join(args.output_dir, "dit_bf16.onnx")
         export_dit_to_onnx(
@@ -1396,7 +1401,7 @@ def main(args):
             batch_size=bs,
         )
 
-    elif args.export_mode == "action_head":
+    elif export_mode == "action_head":
         logger.info("\n[Step 4] Exporting action head components to ONNX...")
 
         # 4a. State Encoder
@@ -1422,7 +1427,19 @@ def main(args):
         logger.info("\n--- [4d] Action Decoder ---")
         export_action_decoder_to_onnx(policy, args.output_dir, use_bf16=True, batch_size=bs)
 
-    elif args.export_mode == "full_pipeline":
+    elif export_mode == "vit_llm_only":
+        logger.info("\n[Step 4] Exporting backbone to ONNX...")
+        logger.info("  (ViT TRT + LLM TRT; action head remains PyTorch)")
+
+        # 4a. ViT — exported in FP32 to avoid TRT BF16 kernel fusion accuracy issues
+        logger.info("\n--- [4a] ViT (Qwen3-VL Vision, FP32 for TRT accuracy) ---")
+        export_vit_to_onnx(policy, args.output_dir, vit_capture, use_bf16=False, batch_size=bs)
+
+        # 4b. LLM
+        logger.info("\n--- [4b] LLM (Qwen3-VL Text Model) ---")
+        export_llm_to_onnx(policy, llm_capture, args.output_dir, use_bf16=True, batch_size=bs)
+
+    elif export_mode == "full_pipeline":
         logger.info("\n[Step 4] Exporting full pipeline to ONNX...")
         logger.info("  (ViT TRT + LLM TRT + Action Head TRT)")
 
@@ -1490,11 +1507,14 @@ class ExportConfig:
     embodiment_tag: Optional[EmbodimentTag] = None
     """Embodiment tag. If not provided, auto-detected from model's processor_config.json."""
 
+    modality_config_path: Optional[str] = None
+    """Optional Python file that registers a custom embodiment modality config."""
+
     output_dir: str = "./gr00t_n1d7_onnx"
     """Output directory for ONNX models."""
 
     export_mode: ExportMode = ExportMode.dit_only
-    """Export mode: 'dit_only', 'action_head' (4 components), or 'full_pipeline' (ViT + action head)."""
+    """Export mode: 'dit_only', 'action_head', 'vit_llm_only', or 'full_pipeline'."""
 
     precision: Literal["bf16"] = "bf16"
     """Export precision for the generated ONNX graph.
