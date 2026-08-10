@@ -63,7 +63,9 @@ class ExportMode(_StrEnum):
 
     dit_only = enum.auto()
     action_head = enum.auto()
+    prefix_rtc_action_head = enum.auto()
     vit_llm_only = enum.auto()
+    prefix_rtc_full_pipeline = enum.auto()
     full_pipeline = enum.auto()
 
 
@@ -71,7 +73,9 @@ class VerifyMode(_StrEnum):
     """Allowed values for ``verify_n1d7_trt`` ``--mode``."""
 
     action_head = enum.auto()
+    prefix_rtc_action_head = enum.auto()
     n17_full_pipeline = enum.auto()
+    prefix_rtc_full_pipeline = enum.auto()
     vit_llm_only = enum.auto()
 
 
@@ -79,7 +83,9 @@ class BenchmarkMode(_StrEnum):
     """Allowed values for ``benchmark_inference`` ``--trt-mode``."""
 
     dit_only = enum.auto()
+    prefix_rtc_action_head = enum.auto()
     n17_full_pipeline = enum.auto()
+    prefix_rtc_full_pipeline = enum.auto()
     vit_llm_only = enum.auto()
 
 
@@ -87,5 +93,6 @@ class BuildEngineMode(_StrEnum):
     """Allowed values for ``build_tensorrt_engine`` ``--mode``."""
 
     single = enum.auto()
+    action_head = enum.auto()
     vit_llm_only = enum.auto()
     full_pipeline = enum.auto()

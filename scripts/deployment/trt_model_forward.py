@@ -66,6 +66,11 @@ _deploy_dir = os.path.dirname(os.path.abspath(__file__))
 if _deploy_dir not in sys.path:
     sys.path.insert(0, _deploy_dir)
 from trt_torch import Engine  # noqa: E402
+from prefix_rtc_utils import (  # noqa: E402
+    configure_prefix_rtc,
+    ensure_prefix_rtc_policy_options,
+    prefix_timestep_bucket,
+)
 
 
 def _assert_supports_trt_padding_strip(attention_mask: torch.Tensor) -> None:
@@ -573,6 +578,152 @@ def action_head_tensorrt_forward(self, backbone_output, action_input, options=No
     return BatchFeature(data={"action_pred": actions})
 
 
+def prefix_rtc_action_head_tensorrt_forward(self, backbone_output, action_input, options=None):
+    """Prefix-RTC action-head TRT forward.
+
+    This mirrors the Psi0 hard-prefix RTC sampler:
+    - action encoder receives per-frame timesteps [B, action_horizon]
+    - DiT receives per-token timesteps [B, 1 + action_horizon]
+    - known prefix frames are overwritten before and after every Euler step
+
+    The exported engines for this mode are not compatible with the plain
+    ``action_head`` mode because their timestep input ranks differ.
+    """
+    backbone_features = backbone_output.backbone_features
+    backbone_features = self.vlln(backbone_features)
+    if hasattr(self, "vl_sa_engine") and self.vl_sa_engine is not None:
+        engine_dtype = torch.bfloat16
+        if backbone_features.dtype != engine_dtype:
+            backbone_features = backbone_features.to(engine_dtype)
+        self.vl_sa_engine.set_runtime_tensor_shape("hidden_states", backbone_features.shape)
+        backbone_features = self.vl_sa_engine(backbone_features)["output"]
+    else:
+        backbone_features = self.vl_self_attention(backbone_features)
+    vl_embs = backbone_features
+
+    embodiment_id = action_input.embodiment_id
+    batch_size = vl_embs.shape[0]
+    device = vl_embs.device
+
+    engine_dtype = torch.bfloat16
+    if vl_embs.dtype != engine_dtype:
+        vl_embs = vl_embs.to(engine_dtype)
+    if action_input.state.dtype != engine_dtype:
+        action_input.state = action_input.state.to(engine_dtype)
+    if embodiment_id.dtype != torch.int64:
+        embodiment_id = embodiment_id.to(torch.int64)
+
+    state = action_input.state
+    if state.ndim == 3 and state.shape[1] > 1:
+        state = state.view(state.shape[0], 1, -1)
+    elif state.ndim != 3:
+        logger.warning(f"Unexpected state shape: {state.shape}")
+
+    self.state_encoder_engine.set_runtime_tensor_shape("state", state.shape)
+    self.state_encoder_engine.set_runtime_tensor_shape("embodiment_id", embodiment_id.shape)
+    state_features = self.state_encoder_engine(state, embodiment_id)["output"]
+
+    action_horizon = int(self.config.action_horizon)
+    if hasattr(self, "init_actions"):
+        actions = self.init_actions.expand((batch_size, -1, -1)).to(
+            dtype=engine_dtype, device=device
+        )
+    else:
+        actions = torch.randn(
+            size=(batch_size, action_horizon, self.action_dim),
+            dtype=engine_dtype,
+            device=device,
+        )
+
+    rtc_prefix = None
+    rtc_overlap_steps = 0
+    if "action" in action_input:
+        if options is None:
+            raise ValueError("options is required when action_input contains RTC action")
+        if "action_horizon" not in options or "rtc_overlap_steps" not in options:
+            raise ValueError("RTC options require action_horizon and rtc_overlap_steps")
+        action_horizon_before_padding = int(options["action_horizon"])
+        rtc_overlap_steps = int(options["rtc_overlap_steps"])
+        if not (0 < rtc_overlap_steps < action_horizon):
+            raise ValueError(
+                f"rtc_overlap_steps must be in (0, {action_horizon}), got {rtc_overlap_steps}"
+            )
+        rtc_prefix = action_input["action"][
+            :,
+            action_horizon_before_padding - rtc_overlap_steps : action_horizon_before_padding,
+            :,
+        ].to(dtype=actions.dtype, device=device)
+        actions[:, :rtc_overlap_steps, :] = rtc_prefix
+
+    num_steps = self.num_inference_timesteps
+    dt = 1.0 / num_steps
+
+    for step in range(num_steps):
+        if rtc_prefix is not None:
+            actions[:, :rtc_overlap_steps, :] = rtc_prefix
+
+        t_cont = step / float(num_steps)
+        t_discretized = int(t_cont * self.num_timestep_buckets)
+        t_global = torch.full(
+            size=(batch_size,), fill_value=t_discretized, device=device, dtype=torch.int64
+        )
+        t_action = t_global[:, None].expand(-1, action_horizon).clone()
+        if rtc_prefix is not None:
+            t_action[:, :rtc_overlap_steps] = prefix_timestep_bucket(self)
+        t_sa = torch.cat([t_global[:, None], t_action], dim=1)
+
+        self.action_encoder_engine.set_runtime_tensor_shape("actions", actions.shape)
+        self.action_encoder_engine.set_runtime_tensor_shape("timesteps", t_action.shape)
+        self.action_encoder_engine.set_runtime_tensor_shape("embodiment_id", embodiment_id.shape)
+        action_features = self.action_encoder_engine(
+            actions.to(engine_dtype), t_action, embodiment_id
+        )["output"]
+
+        if self.config.add_pos_embed:
+            pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
+            pos_embs = self.position_embedding(pos_ids).unsqueeze(0).to(engine_dtype)
+            action_features = action_features + pos_embs
+
+        sa_embs = torch.cat((state_features, action_features), dim=1).to(engine_dtype)
+
+        self.dit_engine.set_runtime_tensor_shape("sa_embs", sa_embs.shape)
+        self.dit_engine.set_runtime_tensor_shape("vl_embs", vl_embs.shape)
+        self.dit_engine.set_runtime_tensor_shape("timestep", t_sa.shape)
+
+        dit_kwargs = {}
+        if hasattr(backbone_output, "image_mask") and backbone_output.image_mask is not None:
+            image_mask = backbone_output.image_mask
+            self.dit_engine.set_runtime_tensor_shape("image_mask", image_mask.shape)
+            dit_kwargs["image_mask"] = image_mask
+
+        if (
+            hasattr(backbone_output, "backbone_attention_mask")
+            and backbone_output.backbone_attention_mask is not None
+        ):
+            bb_mask = backbone_output.backbone_attention_mask
+            self.dit_engine.set_runtime_tensor_shape("backbone_attention_mask", bb_mask.shape)
+            dit_kwargs["backbone_attention_mask"] = bb_mask
+
+        model_output = self.dit_engine(sa_embs, vl_embs, t_sa, **dit_kwargs)["output"]
+
+        self.action_decoder_engine.set_runtime_tensor_shape("model_output", model_output.shape)
+        self.action_decoder_engine.set_runtime_tensor_shape("embodiment_id", embodiment_id.shape)
+        pred = self.action_decoder_engine(model_output, embodiment_id)["output"]
+        pred_velocity = pred[:, -action_horizon:]
+        actions = actions + dt * pred_velocity
+
+        if rtc_prefix is not None:
+            actions[:, :rtc_overlap_steps, :] = rtc_prefix
+
+    return BatchFeature(
+        data={
+            "action_pred": actions,
+            "backbone_features": vl_embs,
+            "state_features": state_features,
+        }
+    )
+
+
 # ============================================================
 # Engine Setup
 # ============================================================
@@ -586,7 +737,10 @@ def setup_tensorrt_engines(policy, trt_engine_path, mode="n17_full_pipeline"):
         trt_engine_path: Path to directory containing TRT engine files
         mode: 'n17_full_pipeline' (ViT TRT + LLM TRT + Action Head TRT),
               'vit_llm_only' (ViT TRT + LLM TRT, Action Head in PyTorch),
-              'action_head' (Action Head TRT only), or 'dit_only'
+              'action_head' (Action Head TRT only),
+              'prefix_rtc_action_head' (RTC-capable Action Head TRT only),
+              'prefix_rtc_full_pipeline' (ViT + LLM + RTC Action Head TRT),
+              or 'dit_only'
     """
     if mode == "n17_full_pipeline":
         _setup_n17_full_pipeline(policy, trt_engine_path)
@@ -594,12 +748,18 @@ def setup_tensorrt_engines(policy, trt_engine_path, mode="n17_full_pipeline"):
         _setup_vit_llm_only(policy, trt_engine_path)
     elif mode == "action_head":
         _setup_action_head(policy, trt_engine_path)
+    elif mode == "prefix_rtc_action_head":
+        _setup_prefix_rtc_action_head(policy, trt_engine_path)
+    elif mode == "prefix_rtc_full_pipeline":
+        _setup_vit_llm_only(policy, trt_engine_path)
+        _setup_prefix_rtc_action_head(policy, trt_engine_path)
     elif mode == "dit_only":
         _setup_dit_only(policy, trt_engine_path)
     else:
         raise ValueError(
             f"Unknown mode: {mode}. Expected 'n17_full_pipeline', 'vit_llm_only', "
-            f"'action_head', or 'dit_only'."
+            f"'action_head', 'prefix_rtc_action_head', 'prefix_rtc_full_pipeline', "
+            f"or 'dit_only'."
         )
 
 
@@ -801,6 +961,66 @@ def _setup_action_head(policy, trt_engine_path):
 
     print("Action head TRT engines loaded and forward method patched.")
     print("  Backbone remains in PyTorch (Qwen3-VL).")
+
+
+def _setup_prefix_rtc_action_head(policy, trt_engine_path):
+    """Set up RTC-capable TensorRT engines for the action head.
+
+    This mode requires action_encoder.engine exported with timesteps [B,T] and
+    dit_bf16.engine exported with timestep [B,1+T].
+    """
+    action_head = policy.model.action_head
+    resolved_mode = configure_prefix_rtc(
+        action_head,
+        getattr(action_head, "_prefix_rtc_timestep_mode", None),
+    )
+    ensure_prefix_rtc_policy_options(policy)
+
+    # Load vl_self_attention TRT engine when prefix_rtc_full_pipeline exported it.
+    vl_sa_engine_path = os.path.join(trt_engine_path, "vl_self_attention.engine")
+    if os.path.exists(vl_sa_engine_path):
+        print(f"Loading VL Self-Attention engine: {vl_sa_engine_path}")
+        action_head.vl_sa_engine = Engine(vl_sa_engine_path)
+        if hasattr(action_head, "vl_self_attention"):
+            del action_head.vl_self_attention
+            torch.cuda.empty_cache()
+        print("  Deleted PyTorch vl_self_attention (replaced by TRT engine)")
+    else:
+        action_head.vl_sa_engine = None
+        print(f"  VL Self-Attention engine not found at {vl_sa_engine_path}, using PyTorch")
+
+    if hasattr(action_head, "model"):
+        del action_head.model
+    if hasattr(action_head, "state_encoder"):
+        del action_head.state_encoder
+    if hasattr(action_head, "action_encoder"):
+        del action_head.action_encoder
+    if hasattr(action_head, "action_decoder"):
+        del action_head.action_decoder
+    torch.cuda.empty_cache()
+
+    assert action_head.action_dim == action_head.config.max_action_dim, (
+        f"action_dim mismatch: action_head.action_dim={action_head.action_dim} "
+        f"!= config.max_action_dim={action_head.config.max_action_dim}"
+    )
+
+    print(f"Loading Prefix-RTC action head engines from: {trt_engine_path}")
+    action_head.state_encoder_engine = Engine(os.path.join(trt_engine_path, "state_encoder.engine"))
+    action_head.action_encoder_engine = Engine(
+        os.path.join(trt_engine_path, "action_encoder.engine")
+    )
+    action_head.dit_engine = Engine(os.path.join(trt_engine_path, "dit_bf16.engine"))
+    action_head.action_decoder_engine = Engine(
+        os.path.join(trt_engine_path, "action_decoder.engine")
+    )
+
+    action_head.get_action = partial(prefix_rtc_action_head_tensorrt_forward, action_head)
+
+    print("Prefix-RTC action head TRT engines loaded and forward method patched.")
+    print(
+        "  Backbone current mode preserved | Action Head: Prefix-RTC TRT "
+        f"(timestep_mode={resolved_mode}, bucket={prefix_timestep_bucket(action_head)})"
+    )
 
 
 def _setup_dit_only(policy, trt_engine_path):

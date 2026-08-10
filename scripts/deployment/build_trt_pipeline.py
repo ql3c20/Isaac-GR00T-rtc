@@ -91,8 +91,18 @@ VALID_STEPS = tuple(Step)
 # Mapping from export_mode -> (build mode, verify mode, benchmark trt_mode)
 _MODE_MAP = {
     "vit_llm_only": ("vit_llm_only", "vit_llm_only", "vit_llm_only"),
+    "prefix_rtc_action_head": (
+        "action_head",
+        "prefix_rtc_action_head",
+        "prefix_rtc_action_head",
+    ),
+    "prefix_rtc_full_pipeline": (
+        "full_pipeline",
+        "prefix_rtc_full_pipeline",
+        "prefix_rtc_full_pipeline",
+    ),
     "full_pipeline": ("full_pipeline", "n17_full_pipeline", "n17_full_pipeline"),
-    "action_head": ("full_pipeline", "action_head", "dit_only"),
+    "action_head": ("action_head", "action_head", "dit_only"),
     "dit_only": ("single", "action_head", "dit_only"),
 }
 
@@ -258,7 +268,13 @@ class PipelineConfig:
 
     # -- Export options ------------------------------------------------------
     export_mode: ExportMode = ExportMode.full_pipeline
-    """Export mode: 'vit_llm_only', 'dit_only', 'action_head', or 'full_pipeline'."""
+    """Export mode: 'vit_llm_only', 'dit_only', 'action_head', 'prefix_rtc_action_head', 'prefix_rtc_full_pipeline', or 'full_pipeline'."""
+
+    prefix_rtc_timestep_mode: Optional[str] = None
+    """Prefix-RTC timestep convention for RTC export modes."""
+
+    rtc_overlap_steps: int = 6
+    """Prefix-RTC overlap used for RTC export/verify modes."""
 
     # -- Build options ------------------------------------------------------
     workspace: int = 8192
@@ -297,6 +313,8 @@ def _run_export(cfg: PipelineConfig, onnx_dir: str, embodiment_tag, log_fp) -> N
         modality_config_path=cfg.modality_config_path,
         output_dir=onnx_dir,
         export_mode=cfg.export_mode,
+        prefix_rtc_timestep_mode=cfg.prefix_rtc_timestep_mode,
+        rtc_overlap_steps=cfg.rtc_overlap_steps,
         precision=cfg.precision,
         batch_size=cfg.batch_size,
     )
@@ -354,6 +372,8 @@ def _run_verify(cfg: PipelineConfig, engine_dir: str, embodiment_tag, log_fp) ->
         embodiment_tag=embodiment_tag,
         modality_config_path=cfg.modality_config_path,
         batch_size=cfg.batch_size,
+        prefix_rtc_timestep_mode=cfg.prefix_rtc_timestep_mode,
+        rtc_overlap_steps=cfg.rtc_overlap_steps,
     )
     with _redirect_to_log(log_fp, tee=True):
         cosine = verify_main(verify_cfg)

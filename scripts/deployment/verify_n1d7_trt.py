@@ -21,6 +21,7 @@ from dataclasses import dataclass
 import os
 import sys
 
+import numpy as np
 import torch
 from torch.nn.functional import cosine_similarity
 import tyro
@@ -35,6 +36,7 @@ from gr00t.data.embodiment_tags import EmbodimentTag
 from gr00t.deployment.modes import VerifyMode
 from gr00t.policy.gr00t_policy import Gr00tPolicy
 from modality_config_utils import import_modality_config
+from prefix_rtc_utils import apply_prefix_rtc
 
 
 @dataclass
@@ -68,6 +70,12 @@ class VerifyConfig:
     step_idx: int = 0
     """Step index within the selected trajectory for PyTorch/TRT comparison."""
 
+    prefix_rtc_timestep_mode: str | None = None
+    """Prefix-RTC timestep convention for Prefix-RTC TRT verification."""
+
+    rtc_overlap_steps: int = 6
+    """Number of RTC overlap frames for Prefix-RTC TRT verification."""
+
 
 def _tile_observation(obs, n):
     """Tile a single observation dict to batch size n."""
@@ -92,6 +100,8 @@ def _tile_observation(obs, n):
 def main(args: VerifyConfig | None = None):
     if args is None:
         args = tyro.cli(VerifyConfig)
+    verify_mode = str(args.mode)
+    prefix_rtc_mode = verify_mode in ("prefix_rtc_action_head", "prefix_rtc_full_pipeline")
 
     print("=" * 60)
     print("N1.7 TRT Action Head Verification")
@@ -105,6 +115,8 @@ def main(args: VerifyConfig | None = None):
         model_path=args.model_path,
         device="cuda",
     )
+    if prefix_rtc_mode:
+        apply_prefix_rtc(policy, prefix_timestep_mode=args.prefix_rtc_timestep_mode)
 
     print("[2] Loading dataset...")
     dataset = LeRobotEpisodeLoader(
@@ -141,17 +153,44 @@ def main(args: VerifyConfig | None = None):
         _capture_vit_hook, with_kwargs=True
     )
 
-    print("[3] Running PyTorch inference...")
     obs = prepare_observation(policy, dataset, traj_idx=args.traj_idx, step_idx=args.step_idx)
+    rtc_options = None
+    if prefix_rtc_mode:
+        action_horizon = int(policy.model.action_head.config.action_horizon)
+        rtc_overlap_steps = int(args.rtc_overlap_steps)
+        if not (0 < rtc_overlap_steps < action_horizon):
+            raise ValueError(
+                f"rtc_overlap_steps must be in (0, {action_horizon}), got {rtc_overlap_steps}"
+            )
+        print("[3a] Preparing Prefix-RTC previous action from PyTorch unconditioned output...")
+        torch.manual_seed(123)
+        with torch.inference_mode():
+            prev_result = policy.get_action(obs)
+        prev_info = prev_result[1] if isinstance(prev_result, tuple) else {}
+        if "normalized_action_pred" not in prev_info:
+            raise RuntimeError("PyTorch policy did not return normalized_action_pred for RTC")
+        rtc_prev_action = np.asarray(prev_info["normalized_action_pred"], dtype=np.float32)
+        rtc_options = {
+            "rtc_prev_action": rtc_prev_action,
+            "action_horizon": int(rtc_prev_action.shape[1]),
+            "rtc_overlap_steps": rtc_overlap_steps,
+        }
+        print(
+            "  rtc_prev_action: "
+            f"shape={rtc_prev_action.shape}, overlap={rtc_overlap_steps}"
+        )
+
+    print("[3] Running PyTorch inference...")
     torch.manual_seed(42)
     with torch.inference_mode():
-        result = policy.get_action(obs)
+        result = policy.get_action(obs, rtc_options)
 
     backbone_hook.remove()
     vit_hook.remove()
 
     # get_action returns (action_dict, info_dict)
     action_dict = result[0] if isinstance(result, tuple) else result
+    pt_info = result[1] if isinstance(result, tuple) else {}
     print(f"  Action keys: {list(action_dict.keys())}")
 
     # Concatenate all action arrays into a single tensor for comparison
@@ -204,11 +243,12 @@ def main(args: VerifyConfig | None = None):
         obs2 = _tile_observation(obs2, args.batch_size)
     torch.manual_seed(42)
     with torch.inference_mode():
-        result2 = policy.get_action(obs2)
+        result2 = policy.get_action(obs2, rtc_options)
 
     backbone_hook2.remove()
 
     action_dict2 = result2[0] if isinstance(result2, tuple) else result2
+    trt_info = result2[1] if isinstance(result2, tuple) else {}
     trt_arrays = []
     for k in sorted(action_dict2.keys()):
         v = action_dict2[k]
@@ -260,7 +300,58 @@ def main(args: VerifyConfig | None = None):
     print(f"  L1 Mean Error:     {l1:.6f}")
     print(f"  L∞ Max Error:      {linf:.6f}")
 
-    if cosine > 0.999:
+    normalized_suffix_cosine = None
+    prefix_linf = None
+    if prefix_rtc_mode:
+        if "normalized_action_pred" not in pt_info or "normalized_action_pred" not in trt_info:
+            raise RuntimeError("Prefix-RTC verification requires normalized_action_pred in info")
+        pt_norm = torch.as_tensor(pt_info["normalized_action_pred"]).float()
+        trt_norm = torch.as_tensor(trt_info["normalized_action_pred"]).float()
+        if args.batch_size > 1 and trt_norm.shape[0] == args.batch_size:
+            trt_norm = trt_norm[0:1]
+        if pt_norm.shape != trt_norm.shape:
+            raise RuntimeError(
+                f"normalized_action_pred shape mismatch: PyTorch {pt_norm.shape}, TRT {trt_norm.shape}"
+            )
+        overlap = int(args.rtc_overlap_steps)
+        pt_prefix = pt_norm[:, :overlap]
+        trt_prefix = trt_norm[:, :overlap]
+        pt_suffix = pt_norm[:, overlap:]
+        trt_suffix = trt_norm[:, overlap:]
+
+        prefix_flat = pt_prefix.flatten()
+        trt_prefix_flat = trt_prefix.flatten()
+        suffix_flat = pt_suffix.flatten()
+        trt_suffix_flat = trt_suffix.flatten()
+
+        prefix_cosine = cosine_similarity(
+            prefix_flat.unsqueeze(0), trt_prefix_flat.unsqueeze(0)
+        ).item()
+        prefix_l1 = (prefix_flat - trt_prefix_flat).abs().mean().item()
+        prefix_linf = (prefix_flat - trt_prefix_flat).abs().max().item()
+        normalized_suffix_cosine = cosine_similarity(
+            suffix_flat.unsqueeze(0), trt_suffix_flat.unsqueeze(0)
+        ).item()
+        suffix_l1 = (suffix_flat - trt_suffix_flat).abs().mean().item()
+        suffix_linf = (suffix_flat - trt_suffix_flat).abs().max().item()
+
+        print("\n[6c] Prefix-RTC normalized action comparison:")
+        print(f"  Prefix Cosine:     {prefix_cosine:.6f}")
+        print(f"  Prefix L1 Mean:    {prefix_l1:.6f}")
+        print(f"  Prefix L∞ Max:     {prefix_linf:.6f}")
+        print(f"  Suffix Cosine:     {normalized_suffix_cosine:.6f}")
+        print(f"  Suffix L1 Mean:    {suffix_l1:.6f}")
+        print(f"  Suffix L∞ Max:     {suffix_linf:.6f}")
+
+    if prefix_rtc_mode and (
+        cosine > 0.999
+        and normalized_suffix_cosine is not None
+        and normalized_suffix_cosine > 0.999
+        and prefix_linf is not None
+        and prefix_linf < 1e-3
+    ):
+        print("\n  PASS — Prefix-RTC TRT matches PyTorch")
+    elif not prefix_rtc_mode and cosine > 0.999:
         print("\n  PASS — TRT matches PyTorch")
     elif cosine > 0.99:
         print("\n  WARN — Minor drift detected")

@@ -18,10 +18,16 @@
 """
 Export GR00T N1.7 model components to ONNX for TensorRT optimization.
 
-Supports four export modes:
+Supports six export modes:
   - dit_only:      Export only the DiT (backward compatible with N1.6).
   - action_head:   Export 4 action head components (ViT + LLM stay in PyTorch).
+  - prefix_rtc_action_head:
+                   Export RTC-capable action head components. The action
+                   encoder accepts per-frame timesteps and DiT accepts
+                   token-level timesteps.
   - vit_llm_only:  Export only ViT + LLM; action head stays in PyTorch.
+  - prefix_rtc_full_pipeline:
+                   Export ViT + LLM + RTC-capable action head components.
   - full_pipeline: Export ViT + LLM + 4 action head components. Lightweight
                    glue ops (embed_tokens, masked_scatter, get_rope_index,
                    VLLN) remain in PyTorch. Referred to as 'n17_full_pipeline'
@@ -62,6 +68,7 @@ from gr00t.data.embodiment_tags import EmbodimentTag
 from gr00t.deployment.modes import ExportMode
 from gr00t.policy.gr00t_policy import Gr00tPolicy
 from modality_config_utils import import_modality_config
+from prefix_rtc_utils import apply_prefix_rtc
 import numpy as np
 import torch
 import torch.nn as nn
@@ -1029,10 +1036,18 @@ def export_state_encoder_to_onnx(policy, output_dir, use_bf16=True, batch_size=1
 # ============================================================
 
 
-def export_action_encoder_to_onnx(policy, output_dir, use_bf16=True, batch_size=1):
+def export_action_encoder_to_onnx(
+    policy,
+    output_dir,
+    use_bf16=True,
+    batch_size=1,
+    per_frame_timesteps=False,
+):
     """Export the action encoder (MultiEmbodimentActionEncoder) to ONNX.
 
-    Input: actions [B, action_horizon, max_action_dim], timesteps [B], embodiment_id [B]
+    Input: actions [B, action_horizon, max_action_dim],
+           timesteps [B] or [B, action_horizon],
+           embodiment_id [B]
     Output: [B, action_horizon, input_embedding_dim]
     """
     logger.info("\n" + "=" * 80)
@@ -1048,7 +1063,12 @@ def export_action_encoder_to_onnx(policy, output_dir, use_bf16=True, batch_size=
     actions = torch.randn(
         batch_size, config.action_horizon, config.max_action_dim, dtype=dtype, device="cuda"
     )
-    timesteps = torch.zeros(batch_size, dtype=torch.int64, device="cuda")
+    if per_frame_timesteps:
+        timesteps = torch.zeros(
+            batch_size, config.action_horizon, dtype=torch.int64, device="cuda"
+        )
+    else:
+        timesteps = torch.zeros(batch_size, dtype=torch.int64, device="cuda")
     embodiment_id = torch.zeros(batch_size, dtype=torch.int64, device="cuda")
 
     logger.info(f"  actions: {actions.shape} ({actions.dtype})")
@@ -1080,7 +1100,14 @@ def export_action_encoder_to_onnx(policy, output_dir, use_bf16=True, batch_size=
 # ============================================================
 
 
-def export_dit_to_onnx(policy, captured_inputs, output_path, use_bf16=True, batch_size=1):
+def export_dit_to_onnx(
+    policy,
+    captured_inputs,
+    output_path,
+    use_bf16=True,
+    batch_size=1,
+    token_timesteps=False,
+):
     """Export the DiT (AlternateVLDiT) to ONNX.
 
     N1.7: image_mask and backbone_attention_mask are always present
@@ -1088,7 +1115,7 @@ def export_dit_to_onnx(policy, captured_inputs, output_path, use_bf16=True, batc
 
     Input: sa_embs [B, sa_seq_len, input_embedding_dim],
            vl_embs [B, vl_seq_len, backbone_embedding_dim],
-           timestep [B], image_mask [B, vl_seq_len],
+           timestep [B] or [B, sa_seq_len], image_mask [B, vl_seq_len],
            backbone_attention_mask [B, vl_seq_len]
     Output: [B, sa_seq_len, hidden_size]
     """
@@ -1105,7 +1132,14 @@ def export_dit_to_onnx(policy, captured_inputs, output_path, use_bf16=True, batc
     # Use captured shapes but replace batch dim (index 0) with batch_size
     sa_shape = (batch_size,) + captured_inputs.sa_embs.shape[1:]
     vl_shape = (batch_size,) + captured_inputs.vl_embs.shape[1:]
-    ts_shape = (batch_size,)
+    if token_timesteps:
+        if captured_inputs.timestep is None or captured_inputs.timestep.dim() != 2:
+            raise ValueError(
+                "token_timesteps=True requires captured DiT timestep shape [B, sa_seq_len]"
+            )
+        ts_shape = (batch_size,) + captured_inputs.timestep.shape[1:]
+    else:
+        ts_shape = (batch_size,)
 
     sa_embs = torch.randn(sa_shape, dtype=dtype, device="cuda")
     vl_embs = torch.randn(vl_shape, dtype=dtype, device="cuda")
@@ -1281,6 +1315,9 @@ def main(args):
         model_path=args.model_path,
         device="cuda",
     )
+    export_prefix_rtc = export_mode in ("prefix_rtc_action_head", "prefix_rtc_full_pipeline")
+    if export_prefix_rtc:
+        apply_prefix_rtc(policy, prefix_timestep_mode=args.prefix_rtc_timestep_mode)
     logger.info("  Policy loaded")
 
     # Step 2: Load dataset
@@ -1304,7 +1341,7 @@ def main(args):
     vit_hook = None
     llm_capture = None
     llm_hook = None
-    export_backbone = export_mode in ("full_pipeline", "vit_llm_only")
+    export_backbone = export_mode in ("full_pipeline", "vit_llm_only", "prefix_rtc_full_pipeline")
     if export_backbone:
         vit_capture = ViTInputCapture()
         qwen_model = policy.model.backbone.model
@@ -1319,8 +1356,25 @@ def main(args):
 
     observation = prepare_observation(policy, dataset, traj_idx=0)
     logger.info("  Running inference to capture shapes...")
+    capture_options = None
+    if export_prefix_rtc:
+        action_horizon = int(policy.model.action_head.config.action_horizon)
+        max_action_dim = int(policy.model.action_head.config.max_action_dim)
+        rtc_overlap_steps = int(args.rtc_overlap_steps)
+        if not (0 < rtc_overlap_steps < action_horizon):
+            raise ValueError(
+                f"rtc_overlap_steps must be in (0, {action_horizon}), got {rtc_overlap_steps}"
+            )
+        capture_options = {
+            "rtc_prev_action": np.zeros(
+                (1, action_horizon, max_action_dim),
+                dtype=np.float32,
+            ),
+            "action_horizon": action_horizon,
+            "rtc_overlap_steps": rtc_overlap_steps,
+        }
     with torch.inference_mode():
-        _ = policy.get_action(observation)
+        _ = policy.get_action(observation, capture_options)
 
     dit_hook.remove()
     if vit_hook is not None:
@@ -1379,6 +1433,11 @@ def main(args):
         "backbone_embedding_dim": int(action_head_config.backbone_embedding_dim),
         "embodiment_tag": str(args.embodiment_tag),
         "export_mode": export_mode,
+        "prefix_rtc": bool(export_prefix_rtc),
+        "prefix_rtc_timestep_mode": getattr(
+            policy.model.action_head, "_prefix_rtc_timestep_mode", None
+        ),
+        "rtc_overlap_steps": int(args.rtc_overlap_steps) if export_prefix_rtc else None,
         "precision": args.precision,
         "batch_size": args.batch_size,
     }
@@ -1427,6 +1486,40 @@ def main(args):
         logger.info("\n--- [4d] Action Decoder ---")
         export_action_decoder_to_onnx(policy, args.output_dir, use_bf16=True, batch_size=bs)
 
+    elif export_mode == "prefix_rtc_action_head":
+        logger.info("\n[Step 4] Exporting Prefix-RTC action head components to ONNX...")
+        logger.info("  (Action encoder timesteps=[B,T], DiT timestep=[B,1+T])")
+
+        # 4a. State Encoder
+        logger.info("\n--- [4a] State Encoder ---")
+        export_state_encoder_to_onnx(policy, args.output_dir, use_bf16=True, batch_size=bs)
+
+        # 4b. RTC Action Encoder
+        logger.info("\n--- [4b] Prefix-RTC Action Encoder ---")
+        export_action_encoder_to_onnx(
+            policy,
+            args.output_dir,
+            use_bf16=True,
+            batch_size=bs,
+            per_frame_timesteps=True,
+        )
+
+        # 4c. RTC DiT
+        logger.info("\n--- [4c] Prefix-RTC DiT ---")
+        dit_output_path = os.path.join(args.output_dir, "dit_bf16.onnx")
+        export_dit_to_onnx(
+            policy=policy,
+            captured_inputs=dit_capture,
+            output_path=dit_output_path,
+            use_bf16=True,
+            batch_size=bs,
+            token_timesteps=True,
+        )
+
+        # 4d. Action Decoder
+        logger.info("\n--- [4d] Action Decoder ---")
+        export_action_decoder_to_onnx(policy, args.output_dir, use_bf16=True, batch_size=bs)
+
     elif export_mode == "vit_llm_only":
         logger.info("\n[Step 4] Exporting backbone to ONNX...")
         logger.info("  (ViT TRT + LLM TRT; action head remains PyTorch)")
@@ -1438,6 +1531,54 @@ def main(args):
         # 4b. LLM
         logger.info("\n--- [4b] LLM (Qwen3-VL Text Model) ---")
         export_llm_to_onnx(policy, llm_capture, args.output_dir, use_bf16=True, batch_size=bs)
+
+    elif export_mode == "prefix_rtc_full_pipeline":
+        logger.info("\n[Step 4] Exporting Prefix-RTC full pipeline to ONNX...")
+        logger.info("  (ViT TRT + LLM TRT + Prefix-RTC Action Head TRT)")
+
+        # 4a. ViT
+        logger.info("\n--- [4a] ViT (Qwen3-VL Vision, FP32 for TRT accuracy) ---")
+        export_vit_to_onnx(policy, args.output_dir, vit_capture, use_bf16=False, batch_size=bs)
+
+        # 4b. LLM
+        logger.info("\n--- [4b] LLM (Qwen3-VL Text Model) ---")
+        export_llm_to_onnx(policy, llm_capture, args.output_dir, use_bf16=True, batch_size=bs)
+
+        # 4c. VL Self-Attention (if present)
+        logger.info("\n--- [4c] VL Self-Attention ---")
+        export_vl_self_attention_to_onnx(
+            policy, args.output_dir, vl_seq_len=vl_seq_len, use_bf16=True, batch_size=bs
+        )
+
+        # 4d. State Encoder
+        logger.info("\n--- [4d] State Encoder ---")
+        export_state_encoder_to_onnx(policy, args.output_dir, use_bf16=True, batch_size=bs)
+
+        # 4e. RTC Action Encoder
+        logger.info("\n--- [4e] Prefix-RTC Action Encoder ---")
+        export_action_encoder_to_onnx(
+            policy,
+            args.output_dir,
+            use_bf16=True,
+            batch_size=bs,
+            per_frame_timesteps=True,
+        )
+
+        # 4f. RTC DiT
+        logger.info("\n--- [4f] Prefix-RTC DiT ---")
+        dit_output_path = os.path.join(args.output_dir, "dit_bf16.onnx")
+        export_dit_to_onnx(
+            policy=policy,
+            captured_inputs=dit_capture,
+            output_path=dit_output_path,
+            use_bf16=True,
+            batch_size=bs,
+            token_timesteps=True,
+        )
+
+        # 4g. Action Decoder
+        logger.info("\n--- [4g] Action Decoder ---")
+        export_action_decoder_to_onnx(policy, args.output_dir, use_bf16=True, batch_size=bs)
 
     elif export_mode == "full_pipeline":
         logger.info("\n[Step 4] Exporting full pipeline to ONNX...")
@@ -1514,7 +1655,13 @@ class ExportConfig:
     """Output directory for ONNX models."""
 
     export_mode: ExportMode = ExportMode.dit_only
-    """Export mode: 'dit_only', 'action_head', 'vit_llm_only', or 'full_pipeline'."""
+    """Export mode: 'dit_only', 'action_head', 'prefix_rtc_action_head', 'vit_llm_only', 'prefix_rtc_full_pipeline', or 'full_pipeline'."""
+
+    prefix_rtc_timestep_mode: Optional[str] = None
+    """Prefix-RTC timestep convention: 'legacy_zero' or 'groot_clean'. Defaults to checkpoint config."""
+
+    rtc_overlap_steps: int = 6
+    """Prefix-RTC overlap used only to capture RTC export shapes."""
 
     precision: Literal["bf16"] = "bf16"
     """Export precision for the generated ONNX graph.

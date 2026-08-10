@@ -18,8 +18,9 @@
 """
 Build TensorRT engines from exported ONNX models.
 
-Supports three modes:
+Supports four modes:
 - single: Build engine for a single ONNX model
+- action_head: Build only action head engines
 - vit_llm_only: Build only Qwen3-VL ViT + LLM engines
 - full_pipeline: Build engines for all pipeline components
   (ViT, LLM, VL Self-Attention, State Encoder, Action Encoder, DiT, Action Decoder)
@@ -560,7 +561,7 @@ class BuildConfig:
     """Configuration for building TensorRT engines from ONNX models."""
 
     mode: BuildEngineMode = BuildEngineMode.single
-    """Build mode: 'single', 'vit_llm_only' (ViT + LLM), or 'full_pipeline'."""
+    """Build mode: 'single', 'action_head', 'vit_llm_only' (ViT + LLM), or 'full_pipeline'."""
 
     onnx: str | None = None
     """Path to ONNX model (single mode)."""
@@ -586,8 +587,12 @@ def main(args: BuildConfig | None = None, trt_severity=None):
         args = tyro.cli(BuildConfig)
 
     build_mode = str(args.mode)
-    if build_mode in ("full_pipeline", "vit_llm_only"):
-        component_names = {"ViT", "LLM"} if build_mode == "vit_llm_only" else None
+    if build_mode in ("full_pipeline", "vit_llm_only", "action_head"):
+        component_names = None
+        if build_mode == "vit_llm_only":
+            component_names = {"ViT", "LLM"}
+        elif build_mode == "action_head":
+            component_names = {"State Encoder", "Action Encoder", "DiT", "Action Decoder"}
         build_full_pipeline(
             onnx_dir=args.onnx_dir,
             engine_dir=args.engine_dir,
