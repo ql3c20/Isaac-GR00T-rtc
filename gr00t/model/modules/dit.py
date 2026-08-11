@@ -58,6 +58,78 @@ def _sdpa_context():
     )
 
 
+def _cross_attention_with_encoder_kv_cache(
+    attn: Attention,
+    hidden_states: torch.Tensor,
+    encoder_hidden_states: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    encoder_kv_cache: dict[int, tuple[torch.Tensor, torch.Tensor]],
+    cache_key: int,
+) -> torch.Tensor:
+    """Run diffusers Attention cross-attn while caching encoder-side K/V."""
+    residual = hidden_states
+
+    if attn.spatial_norm is not None:
+        hidden_states = attn.spatial_norm(hidden_states, None)
+
+    input_ndim = hidden_states.ndim
+    if input_ndim == 4:
+        batch_size, channel, height, width = hidden_states.shape
+        hidden_states = hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
+
+    batch_size, sequence_length, _ = encoder_hidden_states.shape
+    if attention_mask is not None:
+        attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
+        attention_mask = attention_mask.view(batch_size, attn.heads, -1, attention_mask.shape[-1])
+
+    if attn.group_norm is not None:
+        hidden_states = attn.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
+
+    query = attn.to_q(hidden_states)
+
+    cached = encoder_kv_cache.get(cache_key)
+    if cached is None:
+        if attn.norm_cross:
+            encoder_hidden_states = attn.norm_encoder_hidden_states(encoder_hidden_states)
+
+        key = attn.to_k(encoder_hidden_states)
+        value = attn.to_v(encoder_hidden_states)
+
+        inner_dim = key.shape[-1]
+        head_dim = inner_dim // attn.heads
+        key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+        value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+
+        if attn.norm_k is not None:
+            key = attn.norm_k(key)
+
+        encoder_kv_cache[cache_key] = (key, value)
+    else:
+        key, value = cached
+        head_dim = key.shape[-1]
+
+    query = query.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+    if attn.norm_q is not None:
+        query = attn.norm_q(query)
+
+    hidden_states = F.scaled_dot_product_attention(
+        query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
+    )
+    hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
+    hidden_states = hidden_states.to(query.dtype)
+
+    hidden_states = attn.to_out[0](hidden_states)
+    hidden_states = attn.to_out[1](hidden_states)
+
+    if input_ndim == 4:
+        hidden_states = hidden_states.transpose(-1, -2).reshape(batch_size, channel, height, width)
+
+    if attn.residual_connection:
+        hidden_states = hidden_states + residual
+
+    return hidden_states / attn.rescale_output_factor
+
+
 class TimestepEncoder(nn.Module):
     def __init__(self, embedding_dim, compute_dtype=torch.float32):
         super().__init__()
@@ -184,6 +256,8 @@ class BasicTransformerBlock(nn.Module):
         encoder_hidden_states: Optional[torch.Tensor] = None,
         encoder_attention_mask: Optional[torch.Tensor] = None,
         temb: Optional[torch.LongTensor] = None,
+        encoder_kv_cache: Optional[dict[int, tuple[torch.Tensor, torch.Tensor]]] = None,
+        encoder_kv_cache_key: Optional[int] = None,
     ) -> torch.Tensor:
         # 0. Self-Attention
         if self.norm_type == "ada_norm":
@@ -194,14 +268,27 @@ class BasicTransformerBlock(nn.Module):
         if self.pos_embed is not None:
             norm_hidden_states = self.pos_embed(norm_hidden_states)
 
+        attn_mask = encoder_attention_mask if encoder_hidden_states is not None else attention_mask
         with _sdpa_context():
-            attn_output = self.attn1(
-                norm_hidden_states,
-                encoder_hidden_states=encoder_hidden_states,
-                attention_mask=(
-                    encoder_attention_mask if encoder_hidden_states is not None else attention_mask
-                ),
-            )
+            if (
+                encoder_hidden_states is not None
+                and encoder_kv_cache is not None
+                and encoder_kv_cache_key is not None
+            ):
+                attn_output = _cross_attention_with_encoder_kv_cache(
+                    self.attn1,
+                    norm_hidden_states,
+                    encoder_hidden_states,
+                    attn_mask,
+                    encoder_kv_cache,
+                    encoder_kv_cache_key,
+                )
+            else:
+                attn_output = self.attn1(
+                    norm_hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                    attention_mask=attn_mask,
+                )
         if self.final_dropout:
             attn_output = self.final_dropout(attn_output)
 
@@ -296,6 +383,7 @@ class DiT(ModelMixin, ConfigMixin):
         timestep: Optional[torch.LongTensor] = None,
         encoder_attention_mask: Optional[torch.Tensor] = None,
         return_all_hidden_states: bool = False,
+        encoder_kv_cache: Optional[dict[int, tuple[torch.Tensor, torch.Tensor]]] = None,
     ):
         # Encode timesteps
         temb = self.timestep_encoder(timestep)
@@ -323,6 +411,8 @@ class DiT(ModelMixin, ConfigMixin):
                     encoder_hidden_states=encoder_hidden_states,
                     encoder_attention_mask=None,
                     temb=temb,
+                    encoder_kv_cache=encoder_kv_cache,
+                    encoder_kv_cache_key=idx,
                 )
             all_hidden_states.append(hidden_states)
 
@@ -355,6 +445,7 @@ class AlternateVLDiT(DiT):
         return_all_hidden_states: bool = False,
         image_mask: Optional[torch.Tensor] = None,
         backbone_attention_mask: Optional[torch.Tensor] = None,
+        encoder_kv_cache: Optional[dict[int, tuple[torch.Tensor, torch.Tensor]]] = None,
     ):
         assert image_mask is not None, "Image mask is required"
 
@@ -401,6 +492,8 @@ class AlternateVLDiT(DiT):
                     encoder_hidden_states=encoder_hidden_states,
                     encoder_attention_mask=curr_encoder_attention_mask,
                     temb=temb,
+                    encoder_kv_cache=encoder_kv_cache,
+                    encoder_kv_cache_key=idx,
                 )
             all_hidden_states.append(hidden_states)
 

@@ -14,6 +14,7 @@
 # limitations under the License.
 
 from copy import deepcopy
+from collections import OrderedDict
 import json
 import logging
 import os
@@ -300,6 +301,10 @@ class Gr00tN1d7Processor(BaseProcessor):
             model_type=model_type,
             transformers_loading_kwargs=transformers_loading_kwargs,
         )
+        self._chat_template_cache_size = int(os.environ.get("GR00T_CHAT_TEMPLATE_CACHE_SIZE", "16"))
+        self._chat_template_cache: OrderedDict[tuple[str, int], str] = OrderedDict()
+        self._chat_template_cache_hits = 0
+        self._chat_template_cache_misses = 0
         self.train()
 
     @property
@@ -536,10 +541,25 @@ class Gr00tN1d7Processor(BaseProcessor):
             }
         ]
 
-        # Apply chat template but don't process yet - let collator handle it
-        text = self.processor.apply_chat_template(
-            conversation, tokenize=False, add_generation_prompt=False
-        )
+        cache_key = (language, len(pil_images))
+        text = None
+        if self._chat_template_cache_size > 0:
+            text = self._chat_template_cache.get(cache_key)
+            if text is not None:
+                self._chat_template_cache_hits += 1
+                self._chat_template_cache.move_to_end(cache_key)
+
+        if text is None:
+            self._chat_template_cache_misses += 1
+            # Apply chat template but don't process yet - let collator handle it
+            text = self.processor.apply_chat_template(
+                conversation, tokenize=False, add_generation_prompt=False
+            )
+            if self._chat_template_cache_size > 0:
+                self._chat_template_cache[cache_key] = text
+                self._chat_template_cache.move_to_end(cache_key)
+                while len(self._chat_template_cache) > self._chat_template_cache_size:
+                    self._chat_template_cache.popitem(last=False)
 
         # Return vlm_content format for collation
         return {

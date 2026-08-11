@@ -28,6 +28,13 @@ Supports six export modes:
   - vit_llm_only:  Export only ViT + LLM; action head stays in PyTorch.
   - prefix_rtc_full_pipeline:
                    Export ViT + LLM + RTC-capable action head components.
+  - prefix_rtc_action_sampler:
+                   Export the fused Prefix-RTC action sampler. The sampler
+                   unrolls all denoise steps and reuses DiT cross-attention
+                   encoder K/V inside one ONNX/TRT graph.
+  - prefix_rtc_full_pipeline_sampler:
+                   Export ViT + LLM + VL self-attention + state encoder +
+                   fused Prefix-RTC action sampler.
   - full_pipeline: Export ViT + LLM + 4 action head components. Lightweight
                    glue ops (embed_tokens, masked_scatter, get_rope_index,
                    VLLN) remain in PyTorch. Referred to as 'n17_full_pipeline'
@@ -68,7 +75,7 @@ from gr00t.data.embodiment_tags import EmbodimentTag
 from gr00t.deployment.modes import ExportMode
 from gr00t.policy.gr00t_policy import Gr00tPolicy
 from modality_config_utils import import_modality_config
-from prefix_rtc_utils import apply_prefix_rtc
+from prefix_rtc_utils import apply_prefix_rtc, prefix_timestep_bucket
 import numpy as np
 import torch
 import torch.nn as nn
@@ -1289,6 +1296,272 @@ def export_action_decoder_to_onnx(policy, output_dir, use_bf16=True, batch_size=
 
 
 # ============================================================
+# Export Functions: Prefix-RTC Fused Action Sampler
+# ============================================================
+
+
+def export_prefix_rtc_action_sampler_to_onnx(
+    policy,
+    captured_inputs,
+    output_dir,
+    use_bf16=True,
+    batch_size=1,
+):
+    """Export a fused Prefix-RTC action sampler.
+
+    The exported graph unrolls the action-head denoising loop and passes a
+    single Python-side ``encoder_kv_cache`` dict across the unrolled DiT calls.
+    During tracing, the first DiT call materializes encoder-side K/V tensors
+    for each cross-attention block and later calls reuse those tensors inside
+    the same static ONNX graph.
+
+    Runtime glue that remains outside this engine:
+      - VLLN + optional VL self-attention
+      - state encoder
+      - RTC prefix extraction from the previous chunk
+      - random/init action generation
+
+    Inputs:
+      vl_embs: [B, vl_seq_len, backbone_embedding_dim]
+      state_features: [B, 1, input_embedding_dim]
+      embodiment_id: [B]
+      init_actions: [B, action_horizon, max_action_dim]
+      rtc_prefix_actions: [B, action_horizon, max_action_dim]
+      rtc_prefix_mask: [B, action_horizon, 1] bool
+      image_mask/backbone_attention_mask: [B, vl_seq_len] bool, when captured
+    Output:
+      action_pred: [B, action_horizon, max_action_dim]
+    """
+    logger.info("\n" + "=" * 80)
+    logger.info("Exporting Prefix-RTC fused action sampler to ONNX")
+    logger.info("=" * 80)
+
+    action_head = policy.model.action_head
+    config = action_head.config
+    dtype = torch.bfloat16 if use_bf16 else torch.float32
+    prefix_bucket = int(prefix_timestep_bucket(action_head))
+    use_image_mask = captured_inputs.image_mask is not None
+    use_backbone_mask = captured_inputs.backbone_attention_mask is not None
+
+    class PrefixRTCFusedActionSampler(torch.nn.Module):
+        def __init__(
+            self,
+            action_head,
+            prefix_timestep: int,
+            use_image_mask: bool,
+            use_backbone_mask: bool,
+        ):
+            super().__init__()
+            self.action_encoder = action_head.action_encoder
+            self.dit = action_head.model
+            self.action_decoder = action_head.action_decoder
+            self.position_embedding = action_head.position_embedding
+            self.add_pos_embed = bool(action_head.config.add_pos_embed)
+            self.action_horizon = int(action_head.config.action_horizon)
+            self.num_inference_timesteps = int(action_head.num_inference_timesteps)
+            self.num_timestep_buckets = int(action_head.num_timestep_buckets)
+            self.prefix_timestep = int(prefix_timestep)
+            self.use_alternate_vl_dit = bool(action_head.config.use_alternate_vl_dit)
+            self.use_image_mask = use_image_mask
+            self.use_backbone_mask = use_backbone_mask
+
+        def forward(
+            self,
+            vl_embs,
+            state_features,
+            embodiment_id,
+            init_actions,
+            rtc_prefix_actions,
+            rtc_prefix_mask,
+            image_mask=None,
+            backbone_attention_mask=None,
+        ):
+            actions = torch.where(rtc_prefix_mask, rtc_prefix_actions, init_actions)
+            dt = 1.0 / self.num_inference_timesteps
+            dit_encoder_kv_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+            prefix_mask_2d = rtc_prefix_mask.squeeze(-1)
+
+            for step in range(self.num_inference_timesteps):
+                actions = torch.where(rtc_prefix_mask, rtc_prefix_actions, actions)
+
+                t_cont = step / float(self.num_inference_timesteps)
+                t_discretized = int(t_cont * self.num_timestep_buckets)
+                t_global = torch.full(
+                    size=(vl_embs.shape[0],),
+                    fill_value=t_discretized,
+                    device=vl_embs.device,
+                    dtype=torch.int64,
+                )
+                t_action = t_global[:, None].expand(-1, self.action_horizon)
+                t_prefix = torch.full_like(t_action, fill_value=self.prefix_timestep)
+                t_action = torch.where(prefix_mask_2d, t_prefix, t_action)
+                t_sa = torch.cat([t_global[:, None], t_action], dim=1)
+
+                action_features = self.action_encoder(actions, t_action, embodiment_id)
+                if self.add_pos_embed:
+                    pos_ids = torch.arange(
+                        action_features.shape[1], dtype=torch.long, device=vl_embs.device
+                    )
+                    pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
+                    action_features = action_features + pos_embs
+
+                sa_embs = torch.cat((state_features, action_features), dim=1)
+                if self.use_alternate_vl_dit:
+                    model_output = self.dit(
+                        hidden_states=sa_embs,
+                        encoder_hidden_states=vl_embs,
+                        timestep=t_sa,
+                        image_mask=image_mask if self.use_image_mask else None,
+                        backbone_attention_mask=backbone_attention_mask
+                        if self.use_backbone_mask
+                        else None,
+                        encoder_kv_cache=dit_encoder_kv_cache,
+                    )
+                else:
+                    model_output = self.dit(
+                        hidden_states=sa_embs,
+                        encoder_hidden_states=vl_embs,
+                        timestep=t_sa,
+                        encoder_kv_cache=dit_encoder_kv_cache,
+                    )
+
+                pred = self.action_decoder(model_output, embodiment_id)
+                actions = actions + dt * pred[:, -self.action_horizon :]
+                actions = torch.where(rtc_prefix_mask, rtc_prefix_actions, actions)
+
+            return actions
+
+    model = PrefixRTCFusedActionSampler(
+        action_head,
+        prefix_timestep=prefix_bucket,
+        use_image_mask=use_image_mask,
+        use_backbone_mask=use_backbone_mask,
+    )
+    model = model.to(dtype).eval().cuda()
+
+    vl_seq_len = captured_inputs.vl_embs.shape[1]
+    vl_embs = torch.randn(
+        batch_size,
+        vl_seq_len,
+        config.backbone_embedding_dim,
+        dtype=dtype,
+        device="cuda",
+    )
+    state_features = torch.randn(
+        batch_size,
+        1,
+        config.input_embedding_dim,
+        dtype=dtype,
+        device="cuda",
+    )
+    embodiment_id = torch.zeros(batch_size, dtype=torch.int64, device="cuda")
+    init_actions = torch.randn(
+        batch_size,
+        config.action_horizon,
+        config.max_action_dim,
+        dtype=dtype,
+        device="cuda",
+    )
+    rtc_prefix_actions = torch.zeros_like(init_actions)
+    rtc_prefix_mask = torch.zeros(
+        batch_size,
+        config.action_horizon,
+        1,
+        dtype=torch.bool,
+        device="cuda",
+    )
+    overlap = min(
+        int(getattr(policy.model.action_head, "_prefix_rtc_export_overlap", 0)),
+        config.action_horizon,
+    )
+    if overlap > 0:
+        rtc_prefix_actions[:, :overlap, :] = torch.randn(
+            batch_size,
+            overlap,
+            config.max_action_dim,
+            dtype=dtype,
+            device="cuda",
+        )
+        rtc_prefix_mask[:, :overlap, :] = True
+
+    export_inputs = [
+        vl_embs,
+        state_features,
+        embodiment_id,
+        init_actions,
+        rtc_prefix_actions,
+        rtc_prefix_mask,
+    ]
+    input_names = [
+        "vl_embs",
+        "state_features",
+        "embodiment_id",
+        "init_actions",
+        "rtc_prefix_actions",
+        "rtc_prefix_mask",
+    ]
+    dynamic_axes = {
+        "vl_embs": {1: "vl_seq_len"},
+    }
+
+    if use_image_mask:
+        image_mask = torch.ones(
+            batch_size,
+            vl_seq_len,
+            dtype=torch.bool,
+            device="cuda",
+        )
+        export_inputs.append(image_mask)
+        input_names.append("image_mask")
+        dynamic_axes["image_mask"] = {1: "vl_seq_len"}
+
+    if use_backbone_mask:
+        backbone_attention_mask = torch.ones(
+            batch_size,
+            vl_seq_len,
+            dtype=torch.bool,
+            device="cuda",
+        )
+        export_inputs.append(backbone_attention_mask)
+        input_names.append("backbone_attention_mask")
+        dynamic_axes["backbone_attention_mask"] = {1: "vl_seq_len"}
+
+    logger.info("  Export input shapes:")
+    for name, tensor in zip(input_names, export_inputs):
+        logger.info(f"    {name}: {tensor.shape} ({tensor.dtype})")
+    logger.info(
+        "  sampler: num_inference_timesteps=%s, prefix_timestep=%s, traced_overlap=%s",
+        model.num_inference_timesteps,
+        prefix_bucket,
+        overlap,
+    )
+
+    precision_tag = "bf16" if use_bf16 else "fp32"
+    output_path = os.path.join(output_dir, f"prefix_rtc_action_sampler_{precision_tag}.onnx")
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+    logger.info(f"  Exporting to {output_path}...")
+    with torch.inference_mode():
+        torch.onnx.export(
+            model,
+            tuple(export_inputs),
+            output_path,
+            input_names=input_names,
+            output_names=["action_pred"],
+            opset_version=19,
+            do_constant_folding=True,
+            export_params=True,
+            dynamic_axes=dynamic_axes,
+            dynamo=False,
+        )
+
+    logger.info("  Prefix-RTC fused action sampler exported successfully!")
+    _consolidate_external_data(output_path)
+    verify_onnx_export(output_path)
+    return output_path
+
+
+# ============================================================
 # Main
 # ============================================================
 
@@ -1315,9 +1588,15 @@ def main(args):
         model_path=args.model_path,
         device="cuda",
     )
-    export_prefix_rtc = export_mode in ("prefix_rtc_action_head", "prefix_rtc_full_pipeline")
+    export_prefix_rtc = export_mode in (
+        "prefix_rtc_action_head",
+        "prefix_rtc_action_sampler",
+        "prefix_rtc_full_pipeline",
+        "prefix_rtc_full_pipeline_sampler",
+    )
     if export_prefix_rtc:
         apply_prefix_rtc(policy, prefix_timestep_mode=args.prefix_rtc_timestep_mode)
+        policy.model.action_head._prefix_rtc_export_overlap = int(args.rtc_overlap_steps)
     logger.info("  Policy loaded")
 
     # Step 2: Load dataset
@@ -1341,7 +1620,12 @@ def main(args):
     vit_hook = None
     llm_capture = None
     llm_hook = None
-    export_backbone = export_mode in ("full_pipeline", "vit_llm_only", "prefix_rtc_full_pipeline")
+    export_backbone = export_mode in (
+        "full_pipeline",
+        "vit_llm_only",
+        "prefix_rtc_full_pipeline",
+        "prefix_rtc_full_pipeline_sampler",
+    )
     if export_backbone:
         vit_capture = ViTInputCapture()
         qwen_model = policy.model.backbone.model
@@ -1434,6 +1718,10 @@ def main(args):
         "embodiment_tag": str(args.embodiment_tag),
         "export_mode": export_mode,
         "prefix_rtc": bool(export_prefix_rtc),
+        "prefix_rtc_fused_action_sampler": export_mode
+        in ("prefix_rtc_action_sampler", "prefix_rtc_full_pipeline_sampler"),
+        "dit_cross_attn_kv_cache": export_mode
+        in ("prefix_rtc_action_sampler", "prefix_rtc_full_pipeline_sampler"),
         "prefix_rtc_timestep_mode": getattr(
             policy.model.action_head, "_prefix_rtc_timestep_mode", None
         ),
@@ -1520,6 +1808,24 @@ def main(args):
         logger.info("\n--- [4d] Action Decoder ---")
         export_action_decoder_to_onnx(policy, args.output_dir, use_bf16=True, batch_size=bs)
 
+    elif export_mode == "prefix_rtc_action_sampler":
+        logger.info("\n[Step 4] Exporting Prefix-RTC fused action sampler to ONNX...")
+        logger.info("  (State encoder separate; sampler engine fuses action encoder + DiT + decoder)")
+
+        # 4a. State Encoder
+        logger.info("\n--- [4a] State Encoder ---")
+        export_state_encoder_to_onnx(policy, args.output_dir, use_bf16=True, batch_size=bs)
+
+        # 4b. Fused action sampler
+        logger.info("\n--- [4b] Prefix-RTC Fused Action Sampler ---")
+        export_prefix_rtc_action_sampler_to_onnx(
+            policy=policy,
+            captured_inputs=dit_capture,
+            output_dir=args.output_dir,
+            use_bf16=True,
+            batch_size=bs,
+        )
+
     elif export_mode == "vit_llm_only":
         logger.info("\n[Step 4] Exporting backbone to ONNX...")
         logger.info("  (ViT TRT + LLM TRT; action head remains PyTorch)")
@@ -1579,6 +1885,38 @@ def main(args):
         # 4g. Action Decoder
         logger.info("\n--- [4g] Action Decoder ---")
         export_action_decoder_to_onnx(policy, args.output_dir, use_bf16=True, batch_size=bs)
+
+    elif export_mode == "prefix_rtc_full_pipeline_sampler":
+        logger.info("\n[Step 4] Exporting Prefix-RTC full pipeline sampler to ONNX...")
+        logger.info("  (ViT TRT + LLM TRT + fused Prefix-RTC Action Sampler)")
+
+        # 4a. ViT
+        logger.info("\n--- [4a] ViT (Qwen3-VL Vision, FP32 for TRT accuracy) ---")
+        export_vit_to_onnx(policy, args.output_dir, vit_capture, use_bf16=False, batch_size=bs)
+
+        # 4b. LLM
+        logger.info("\n--- [4b] LLM (Qwen3-VL Text Model) ---")
+        export_llm_to_onnx(policy, llm_capture, args.output_dir, use_bf16=True, batch_size=bs)
+
+        # 4c. VL Self-Attention (if present)
+        logger.info("\n--- [4c] VL Self-Attention ---")
+        export_vl_self_attention_to_onnx(
+            policy, args.output_dir, vl_seq_len=vl_seq_len, use_bf16=True, batch_size=bs
+        )
+
+        # 4d. State Encoder
+        logger.info("\n--- [4d] State Encoder ---")
+        export_state_encoder_to_onnx(policy, args.output_dir, use_bf16=True, batch_size=bs)
+
+        # 4e. Fused action sampler
+        logger.info("\n--- [4e] Prefix-RTC Fused Action Sampler ---")
+        export_prefix_rtc_action_sampler_to_onnx(
+            policy=policy,
+            captured_inputs=dit_capture,
+            output_dir=args.output_dir,
+            use_bf16=True,
+            batch_size=bs,
+        )
 
     elif export_mode == "full_pipeline":
         logger.info("\n[Step 4] Exporting full pipeline to ONNX...")
@@ -1655,7 +1993,7 @@ class ExportConfig:
     """Output directory for ONNX models."""
 
     export_mode: ExportMode = ExportMode.dit_only
-    """Export mode: 'dit_only', 'action_head', 'prefix_rtc_action_head', 'vit_llm_only', 'prefix_rtc_full_pipeline', or 'full_pipeline'."""
+    """Export mode: 'dit_only', 'action_head', 'prefix_rtc_action_head', 'prefix_rtc_action_sampler', 'vit_llm_only', 'prefix_rtc_full_pipeline', 'prefix_rtc_full_pipeline_sampler', or 'full_pipeline'."""
 
     prefix_rtc_timestep_mode: Optional[str] = None
     """Prefix-RTC timestep convention: 'legacy_zero' or 'groot_clean'. Defaults to checkpoint config."""

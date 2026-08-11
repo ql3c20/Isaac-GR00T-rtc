@@ -53,12 +53,61 @@ from functools import partial
 import logging
 import os
 import sys
+import time
 
 import torch
 from transformers.feature_extraction_utils import BatchFeature
 
 
 logger = logging.getLogger(__name__)
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+def _option_flag(options: dict | None, key: str, env_name: str, default: bool = False) -> bool:
+    if options is not None and key in options:
+        return bool(options[key])
+    return _env_flag(env_name, default)
+
+
+def _sync_for_timing(device: torch.device, enabled: bool) -> None:
+    if enabled and device.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize(device)
+
+
+def _timing_start(timing: dict[str, float] | None, device: torch.device, sync_cuda: bool):
+    if timing is None:
+        return None
+    _sync_for_timing(device, sync_cuda)
+    return time.perf_counter()
+
+
+def _timing_record(
+    timing: dict[str, float] | None,
+    key: str,
+    start,
+    device: torch.device,
+    sync_cuda: bool,
+    *,
+    accumulate: bool = False,
+) -> None:
+    if timing is None or start is None:
+        return
+    _sync_for_timing(device, sync_cuda)
+    elapsed_ms = (time.perf_counter() - start) * 1000.0
+    if accumulate:
+        timing[key] = timing.get(key, 0.0) + elapsed_ms
+    else:
+        timing[key] = elapsed_ms
+
+
+def _engine_has_input(engine, name: str) -> bool:
+    return any(input_name == name for input_name, _shape, _dtype in engine.in_meta)
 
 
 # Ensure sibling modules are importable (scripts/deployment is not a package)
@@ -461,24 +510,29 @@ def action_head_tensorrt_forward(self, backbone_output, action_input, options=No
         backbone_output: BatchFeature with backbone_features, backbone_attention_mask, image_mask
         action_input: BatchFeature with state, embodiment_id
     """
+    return_timing = _option_flag(options, "return_timing", "GR00T_RETURN_TIMING")
+    timing_sync_cuda = _option_flag(options, "timing_sync_cuda", "GR00T_TIMING_SYNC_CUDA")
+    timing: dict[str, float] | None = {} if return_timing else None
+
     # --- VLLN (PyTorch) + vl_self_attention (TRT if available, else PyTorch) ---
     backbone_features = backbone_output.backbone_features
+    device = backbone_features.device
+    engine_dtype = torch.bfloat16
+
+    start = _timing_start(timing, device, timing_sync_cuda)
     backbone_features = self.vlln(backbone_features)
     if hasattr(self, "vl_sa_engine") and self.vl_sa_engine is not None:
-        engine_dtype = torch.bfloat16
         if backbone_features.dtype != engine_dtype:
             backbone_features = backbone_features.to(engine_dtype)
         self.vl_sa_engine.set_runtime_tensor_shape("hidden_states", backbone_features.shape)
         backbone_features = self.vl_sa_engine(backbone_features)["output"]
     else:
         backbone_features = self.vl_self_attention(backbone_features)
+    _timing_record(timing, "vl_self_attention_ms", start, device, timing_sync_cuda)
     vl_embs = backbone_features
 
     embodiment_id = action_input.embodiment_id
     batch_size = vl_embs.shape[0]
-    device = vl_embs.device
-
-    engine_dtype = torch.bfloat16
 
     # Ensure consistent dtypes
     if vl_embs.dtype != engine_dtype:
@@ -502,9 +556,11 @@ def action_head_tensorrt_forward(self, backbone_output, action_input, options=No
         logger.warning(f"Unexpected state shape: {state.shape}")
 
     # --- State Encoder TRT ---
+    start = _timing_start(timing, device, timing_sync_cuda)
     self.state_encoder_engine.set_runtime_tensor_shape("state", state.shape)
     self.state_encoder_engine.set_runtime_tensor_shape("embodiment_id", embodiment_id.shape)
     state_features = self.state_encoder_engine(state, embodiment_id)["output"]
+    _timing_record(timing, "state_encoder_ms", start, device, timing_sync_cuda)
 
     # --- Initialize actions as random noise ---
     if hasattr(self, "init_actions"):
@@ -520,6 +576,7 @@ def action_head_tensorrt_forward(self, backbone_output, action_input, options=No
     dt = 1.0 / num_steps
 
     # --- Denoising loop ---
+    sampler_start = _timing_start(timing, device, timing_sync_cuda)
     for t in range(num_steps):
         t_cont = t / float(num_steps)
         t_discretized = int(t_cont * self.num_timestep_buckets)
@@ -529,6 +586,7 @@ def action_head_tensorrt_forward(self, backbone_output, action_input, options=No
         )
 
         # Action Encoder TRT
+        start = _timing_start(timing, device, timing_sync_cuda)
         self.action_encoder_engine.set_runtime_tensor_shape("actions", actions.shape)
         self.action_encoder_engine.set_runtime_tensor_shape("timesteps", timesteps_tensor.shape)
         self.action_encoder_engine.set_runtime_tensor_shape("embodiment_id", embodiment_id.shape)
@@ -541,11 +599,15 @@ def action_head_tensorrt_forward(self, backbone_output, action_input, options=No
             pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
             pos_embs = self.position_embedding(pos_ids).unsqueeze(0).to(engine_dtype)
             action_features = action_features + pos_embs
+        _timing_record(
+            timing, "action_encoder_ms", start, device, timing_sync_cuda, accumulate=True
+        )
 
         # Concatenate state + action embeddings
         sa_embs = torch.cat((state_features, action_features), dim=1).to(engine_dtype)
 
         # DiT TRT
+        start = _timing_start(timing, device, timing_sync_cuda)
         self.dit_engine.set_runtime_tensor_shape("sa_embs", sa_embs.shape)
         self.dit_engine.set_runtime_tensor_shape("vl_embs", vl_embs.shape)
         self.dit_engine.set_runtime_tensor_shape("timestep", timesteps_tensor.shape)
@@ -565,17 +627,31 @@ def action_head_tensorrt_forward(self, backbone_output, action_input, options=No
             dit_kwargs["backbone_attention_mask"] = bb_mask
 
         model_output = self.dit_engine(sa_embs, vl_embs, timesteps_tensor, **dit_kwargs)["output"]
+        _timing_record(timing, "dit_ms", start, device, timing_sync_cuda, accumulate=True)
 
         # Action Decoder TRT
+        start = _timing_start(timing, device, timing_sync_cuda)
         self.action_decoder_engine.set_runtime_tensor_shape("model_output", model_output.shape)
         self.action_decoder_engine.set_runtime_tensor_shape("embodiment_id", embodiment_id.shape)
         pred = self.action_decoder_engine(model_output, embodiment_id)["output"]
+        _timing_record(
+            timing, "action_decoder_ms", start, device, timing_sync_cuda, accumulate=True
+        )
         pred_velocity = pred[:, -self.action_horizon :]
 
         # Euler integration
         actions = actions + dt * pred_velocity
 
-    return BatchFeature(data={"action_pred": actions})
+    _timing_record(timing, "sampler_ms", sampler_start, device, timing_sync_cuda)
+    if timing is not None:
+        timing["dit_kv_cache_enabled"] = 0.0
+        timing["dit_kv_cache_entries"] = 0.0
+        timing["trt_step_engine_launches"] = float(num_steps * 3)
+
+    data = {"action_pred": actions}
+    if timing is not None:
+        data["timing"] = timing
+    return BatchFeature(data=data)
 
 
 def prefix_rtc_action_head_tensorrt_forward(self, backbone_output, action_input, options=None):
@@ -589,23 +665,29 @@ def prefix_rtc_action_head_tensorrt_forward(self, backbone_output, action_input,
     The exported engines for this mode are not compatible with the plain
     ``action_head`` mode because their timestep input ranks differ.
     """
+    return_timing = _option_flag(options, "return_timing", "GR00T_RETURN_TIMING")
+    timing_sync_cuda = _option_flag(options, "timing_sync_cuda", "GR00T_TIMING_SYNC_CUDA")
+    timing: dict[str, float] | None = {} if return_timing else None
+
     backbone_features = backbone_output.backbone_features
+    device = backbone_features.device
+    engine_dtype = torch.bfloat16
+
+    start = _timing_start(timing, device, timing_sync_cuda)
     backbone_features = self.vlln(backbone_features)
     if hasattr(self, "vl_sa_engine") and self.vl_sa_engine is not None:
-        engine_dtype = torch.bfloat16
         if backbone_features.dtype != engine_dtype:
             backbone_features = backbone_features.to(engine_dtype)
         self.vl_sa_engine.set_runtime_tensor_shape("hidden_states", backbone_features.shape)
         backbone_features = self.vl_sa_engine(backbone_features)["output"]
     else:
         backbone_features = self.vl_self_attention(backbone_features)
+    _timing_record(timing, "vl_self_attention_ms", start, device, timing_sync_cuda)
     vl_embs = backbone_features
 
     embodiment_id = action_input.embodiment_id
     batch_size = vl_embs.shape[0]
-    device = vl_embs.device
 
-    engine_dtype = torch.bfloat16
     if vl_embs.dtype != engine_dtype:
         vl_embs = vl_embs.to(engine_dtype)
     if action_input.state.dtype != engine_dtype:
@@ -619,9 +701,11 @@ def prefix_rtc_action_head_tensorrt_forward(self, backbone_output, action_input,
     elif state.ndim != 3:
         logger.warning(f"Unexpected state shape: {state.shape}")
 
+    start = _timing_start(timing, device, timing_sync_cuda)
     self.state_encoder_engine.set_runtime_tensor_shape("state", state.shape)
     self.state_encoder_engine.set_runtime_tensor_shape("embodiment_id", embodiment_id.shape)
     state_features = self.state_encoder_engine(state, embodiment_id)["output"]
+    _timing_record(timing, "state_encoder_ms", start, device, timing_sync_cuda)
 
     action_horizon = int(self.config.action_horizon)
     if hasattr(self, "init_actions"):
@@ -658,6 +742,7 @@ def prefix_rtc_action_head_tensorrt_forward(self, backbone_output, action_input,
     num_steps = self.num_inference_timesteps
     dt = 1.0 / num_steps
 
+    sampler_start = _timing_start(timing, device, timing_sync_cuda)
     for step in range(num_steps):
         if rtc_prefix is not None:
             actions[:, :rtc_overlap_steps, :] = rtc_prefix
@@ -672,6 +757,7 @@ def prefix_rtc_action_head_tensorrt_forward(self, backbone_output, action_input,
             t_action[:, :rtc_overlap_steps] = prefix_timestep_bucket(self)
         t_sa = torch.cat([t_global[:, None], t_action], dim=1)
 
+        start = _timing_start(timing, device, timing_sync_cuda)
         self.action_encoder_engine.set_runtime_tensor_shape("actions", actions.shape)
         self.action_encoder_engine.set_runtime_tensor_shape("timesteps", t_action.shape)
         self.action_encoder_engine.set_runtime_tensor_shape("embodiment_id", embodiment_id.shape)
@@ -683,9 +769,13 @@ def prefix_rtc_action_head_tensorrt_forward(self, backbone_output, action_input,
             pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
             pos_embs = self.position_embedding(pos_ids).unsqueeze(0).to(engine_dtype)
             action_features = action_features + pos_embs
+        _timing_record(
+            timing, "action_encoder_ms", start, device, timing_sync_cuda, accumulate=True
+        )
 
         sa_embs = torch.cat((state_features, action_features), dim=1).to(engine_dtype)
 
+        start = _timing_start(timing, device, timing_sync_cuda)
         self.dit_engine.set_runtime_tensor_shape("sa_embs", sa_embs.shape)
         self.dit_engine.set_runtime_tensor_shape("vl_embs", vl_embs.shape)
         self.dit_engine.set_runtime_tensor_shape("timestep", t_sa.shape)
@@ -705,23 +795,171 @@ def prefix_rtc_action_head_tensorrt_forward(self, backbone_output, action_input,
             dit_kwargs["backbone_attention_mask"] = bb_mask
 
         model_output = self.dit_engine(sa_embs, vl_embs, t_sa, **dit_kwargs)["output"]
+        _timing_record(timing, "dit_ms", start, device, timing_sync_cuda, accumulate=True)
 
+        start = _timing_start(timing, device, timing_sync_cuda)
         self.action_decoder_engine.set_runtime_tensor_shape("model_output", model_output.shape)
         self.action_decoder_engine.set_runtime_tensor_shape("embodiment_id", embodiment_id.shape)
         pred = self.action_decoder_engine(model_output, embodiment_id)["output"]
+        _timing_record(
+            timing, "action_decoder_ms", start, device, timing_sync_cuda, accumulate=True
+        )
         pred_velocity = pred[:, -action_horizon:]
         actions = actions + dt * pred_velocity
 
         if rtc_prefix is not None:
             actions[:, :rtc_overlap_steps, :] = rtc_prefix
 
-    return BatchFeature(
-        data={
-            "action_pred": actions,
-            "backbone_features": vl_embs,
-            "state_features": state_features,
-        }
+    _timing_record(timing, "sampler_ms", sampler_start, device, timing_sync_cuda)
+    if timing is not None:
+        timing["dit_kv_cache_enabled"] = 0.0
+        timing["dit_kv_cache_entries"] = 0.0
+        timing["trt_step_engine_launches"] = float(num_steps * 3)
+
+    data = {
+        "action_pred": actions,
+        "backbone_features": vl_embs,
+        "state_features": state_features,
+    }
+    if timing is not None:
+        data["timing"] = timing
+    return BatchFeature(data=data)
+
+
+def prefix_rtc_action_sampler_tensorrt_forward(self, backbone_output, action_input, options=None):
+    """Prefix-RTC action head with fused sampler TRT engine.
+
+    This mode keeps VLLN/VL self-attention and state encoder as the same
+    runtime glue used by ``prefix_rtc_action_head``. The denoising loop is
+    replaced by one TRT engine exported from
+    ``prefix_rtc_action_sampler_bf16.onnx``. That engine unrolls the diffusion
+    steps and reuses DiT cross-attention encoder K/V inside the graph.
+    """
+    return_timing = _option_flag(options, "return_timing", "GR00T_RETURN_TIMING")
+    timing_sync_cuda = _option_flag(options, "timing_sync_cuda", "GR00T_TIMING_SYNC_CUDA")
+    timing: dict[str, float] | None = {} if return_timing else None
+
+    backbone_features = backbone_output.backbone_features
+    device = backbone_features.device
+    engine_dtype = torch.bfloat16
+
+    start = _timing_start(timing, device, timing_sync_cuda)
+    backbone_features = self.vlln(backbone_features)
+    if hasattr(self, "vl_sa_engine") and self.vl_sa_engine is not None:
+        if backbone_features.dtype != engine_dtype:
+            backbone_features = backbone_features.to(engine_dtype)
+        self.vl_sa_engine.set_runtime_tensor_shape("hidden_states", backbone_features.shape)
+        backbone_features = self.vl_sa_engine(backbone_features)["output"]
+    else:
+        backbone_features = self.vl_self_attention(backbone_features)
+    _timing_record(timing, "vl_self_attention_ms", start, device, timing_sync_cuda)
+    vl_embs = backbone_features
+
+    embodiment_id = action_input.embodiment_id
+    batch_size = vl_embs.shape[0]
+    if vl_embs.dtype != engine_dtype:
+        vl_embs = vl_embs.to(engine_dtype)
+    if action_input.state.dtype != engine_dtype:
+        action_input.state = action_input.state.to(engine_dtype)
+    if embodiment_id.dtype != torch.int64:
+        embodiment_id = embodiment_id.to(torch.int64)
+
+    state = action_input.state
+    if state.ndim == 3 and state.shape[1] > 1:
+        state = state.view(state.shape[0], 1, -1)
+    elif state.ndim != 3:
+        logger.warning(f"Unexpected state shape: {state.shape}")
+
+    start = _timing_start(timing, device, timing_sync_cuda)
+    self.state_encoder_engine.set_runtime_tensor_shape("state", state.shape)
+    self.state_encoder_engine.set_runtime_tensor_shape("embodiment_id", embodiment_id.shape)
+    state_features = self.state_encoder_engine(state, embodiment_id)["output"]
+    _timing_record(timing, "state_encoder_ms", start, device, timing_sync_cuda)
+
+    action_horizon = int(self.config.action_horizon)
+    if hasattr(self, "init_actions"):
+        init_actions = self.init_actions.expand((batch_size, -1, -1)).to(
+            dtype=engine_dtype, device=device
+        )
+    else:
+        init_actions = torch.randn(
+            size=(batch_size, action_horizon, self.action_dim),
+            dtype=engine_dtype,
+            device=device,
+        )
+
+    rtc_prefix_actions = torch.zeros_like(init_actions)
+    rtc_prefix_mask = torch.zeros(
+        batch_size,
+        action_horizon,
+        1,
+        dtype=torch.bool,
+        device=device,
     )
+    if "action" in action_input:
+        if options is None:
+            raise ValueError("options is required when action_input contains RTC action")
+        if "action_horizon" not in options or "rtc_overlap_steps" not in options:
+            raise ValueError("RTC options require action_horizon and rtc_overlap_steps")
+        action_horizon_before_padding = int(options["action_horizon"])
+        rtc_overlap_steps = int(options["rtc_overlap_steps"])
+        if not (0 < rtc_overlap_steps < action_horizon):
+            raise ValueError(
+                f"rtc_overlap_steps must be in (0, {action_horizon}), got {rtc_overlap_steps}"
+            )
+        rtc_prefix = action_input["action"][
+            :,
+            action_horizon_before_padding - rtc_overlap_steps : action_horizon_before_padding,
+            :,
+        ].to(dtype=init_actions.dtype, device=device)
+        rtc_prefix_actions[:, :rtc_overlap_steps, :] = rtc_prefix
+        rtc_prefix_mask[:, :rtc_overlap_steps, :] = True
+
+    sampler_engine = self.action_sampler_engine
+    sampler_inputs = {
+        "vl_embs": vl_embs,
+        "state_features": state_features,
+        "embodiment_id": embodiment_id,
+        "init_actions": init_actions,
+        "rtc_prefix_actions": rtc_prefix_actions,
+        "rtc_prefix_mask": rtc_prefix_mask,
+    }
+    for name, tensor in sampler_inputs.items():
+        sampler_engine.set_runtime_tensor_shape(name, tensor.shape)
+
+    if _engine_has_input(sampler_engine, "image_mask"):
+        if not hasattr(backbone_output, "image_mask") or backbone_output.image_mask is None:
+            raise ValueError("prefix_rtc_action_sampler.engine requires image_mask")
+        image_mask = backbone_output.image_mask
+        sampler_engine.set_runtime_tensor_shape("image_mask", image_mask.shape)
+        sampler_inputs["image_mask"] = image_mask
+
+    if _engine_has_input(sampler_engine, "backbone_attention_mask"):
+        if (
+            not hasattr(backbone_output, "backbone_attention_mask")
+            or backbone_output.backbone_attention_mask is None
+        ):
+            raise ValueError("prefix_rtc_action_sampler.engine requires backbone_attention_mask")
+        bb_mask = backbone_output.backbone_attention_mask
+        sampler_engine.set_runtime_tensor_shape("backbone_attention_mask", bb_mask.shape)
+        sampler_inputs["backbone_attention_mask"] = bb_mask
+
+    sampler_start = _timing_start(timing, device, timing_sync_cuda)
+    actions = sampler_engine(**sampler_inputs)["action_pred"]
+    _timing_record(timing, "sampler_ms", sampler_start, device, timing_sync_cuda)
+    if timing is not None:
+        timing["dit_kv_cache_enabled"] = 1.0
+        timing["dit_kv_cache_entries"] = float(getattr(self, "_trt_sampler_kv_cache_entries", 0))
+        timing["trt_step_engine_launches"] = 1.0
+
+    data = {
+        "action_pred": actions,
+        "backbone_features": vl_embs,
+        "state_features": state_features,
+    }
+    if timing is not None:
+        data["timing"] = timing
+    return BatchFeature(data=data)
 
 
 # ============================================================
@@ -740,6 +978,8 @@ def setup_tensorrt_engines(policy, trt_engine_path, mode="n17_full_pipeline"):
               'action_head' (Action Head TRT only),
               'prefix_rtc_action_head' (RTC-capable Action Head TRT only),
               'prefix_rtc_full_pipeline' (ViT + LLM + RTC Action Head TRT),
+              'prefix_rtc_action_sampler' (RTC Action Head with fused sampler TRT),
+              'prefix_rtc_full_pipeline_sampler' (ViT + LLM + fused sampler TRT),
               or 'dit_only'
     """
     if mode == "n17_full_pipeline":
@@ -753,12 +993,18 @@ def setup_tensorrt_engines(policy, trt_engine_path, mode="n17_full_pipeline"):
     elif mode == "prefix_rtc_full_pipeline":
         _setup_vit_llm_only(policy, trt_engine_path)
         _setup_prefix_rtc_action_head(policy, trt_engine_path)
+    elif mode == "prefix_rtc_action_sampler":
+        _setup_prefix_rtc_action_sampler(policy, trt_engine_path)
+    elif mode == "prefix_rtc_full_pipeline_sampler":
+        _setup_vit_llm_only(policy, trt_engine_path)
+        _setup_prefix_rtc_action_sampler(policy, trt_engine_path)
     elif mode == "dit_only":
         _setup_dit_only(policy, trt_engine_path)
     else:
         raise ValueError(
             f"Unknown mode: {mode}. Expected 'n17_full_pipeline', 'vit_llm_only', "
             f"'action_head', 'prefix_rtc_action_head', 'prefix_rtc_full_pipeline', "
+            f"'prefix_rtc_action_sampler', 'prefix_rtc_full_pipeline_sampler', "
             f"or 'dit_only'."
         )
 
@@ -1020,6 +1266,78 @@ def _setup_prefix_rtc_action_head(policy, trt_engine_path):
     print(
         "  Backbone current mode preserved | Action Head: Prefix-RTC TRT "
         f"(timestep_mode={resolved_mode}, bucket={prefix_timestep_bucket(action_head)})"
+    )
+
+
+def _setup_prefix_rtc_action_sampler(policy, trt_engine_path):
+    """Set up Prefix-RTC action head with a fused sampler engine."""
+    action_head = policy.model.action_head
+    resolved_mode = configure_prefix_rtc(
+        action_head,
+        getattr(action_head, "_prefix_rtc_timestep_mode", None),
+    )
+    ensure_prefix_rtc_policy_options(policy)
+
+    sampler_engine_path = os.path.join(trt_engine_path, "prefix_rtc_action_sampler.engine")
+    if not os.path.exists(sampler_engine_path):
+        raise FileNotFoundError(
+            f"Prefix-RTC fused sampler engine not found: {sampler_engine_path}\n"
+            f"Export with --export-mode prefix_rtc_full_pipeline_sampler (or "
+            f"prefix_rtc_action_sampler), then build with --mode "
+            f"prefix_rtc_full_pipeline_sampler (or prefix_rtc_action_sampler)."
+        )
+
+    # Load vl_self_attention TRT engine when the full pipeline sampler export emitted it.
+    vl_sa_engine_path = os.path.join(trt_engine_path, "vl_self_attention.engine")
+    if os.path.exists(vl_sa_engine_path):
+        print(f"Loading VL Self-Attention engine: {vl_sa_engine_path}")
+        action_head.vl_sa_engine = Engine(vl_sa_engine_path)
+        if hasattr(action_head, "vl_self_attention"):
+            del action_head.vl_self_attention
+            torch.cuda.empty_cache()
+        print("  Deleted PyTorch vl_self_attention (replaced by TRT engine)")
+    else:
+        action_head.vl_sa_engine = None
+        print(f"  VL Self-Attention engine not found at {vl_sa_engine_path}, using PyTorch")
+
+    kv_entries = 0
+    if hasattr(action_head, "model") and hasattr(action_head.model, "transformer_blocks"):
+        interleave_self_attention = getattr(
+            action_head.model.config,
+            "interleave_self_attention",
+            False,
+        )
+        for idx, _block in enumerate(action_head.model.transformer_blocks):
+            if not (idx % 2 == 1 and interleave_self_attention):
+                kv_entries += 1
+    action_head._trt_sampler_kv_cache_entries = kv_entries
+
+    if hasattr(action_head, "model"):
+        del action_head.model
+    if hasattr(action_head, "state_encoder"):
+        del action_head.state_encoder
+    if hasattr(action_head, "action_encoder"):
+        del action_head.action_encoder
+    if hasattr(action_head, "action_decoder"):
+        del action_head.action_decoder
+    torch.cuda.empty_cache()
+
+    assert action_head.action_dim == action_head.config.max_action_dim, (
+        f"action_dim mismatch: action_head.action_dim={action_head.action_dim} "
+        f"!= config.max_action_dim={action_head.config.max_action_dim}"
+    )
+
+    print(f"Loading Prefix-RTC fused sampler engines from: {trt_engine_path}")
+    action_head.state_encoder_engine = Engine(os.path.join(trt_engine_path, "state_encoder.engine"))
+    action_head.action_sampler_engine = Engine(sampler_engine_path)
+
+    action_head.get_action = partial(prefix_rtc_action_sampler_tensorrt_forward, action_head)
+
+    print("Prefix-RTC fused action sampler TRT engine loaded and forward method patched.")
+    print(
+        "  Backbone current mode preserved | Action Head: Prefix-RTC fused sampler TRT "
+        f"(timestep_mode={resolved_mode}, bucket={prefix_timestep_bucket(action_head)}, "
+        f"kv_entries={kv_entries})"
     )
 
 

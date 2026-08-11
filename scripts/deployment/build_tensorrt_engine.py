@@ -21,9 +21,12 @@ Build TensorRT engines from exported ONNX models.
 Supports four modes:
 - single: Build engine for a single ONNX model
 - action_head: Build only action head engines
+- prefix_rtc_action_sampler: Build state encoder + fused Prefix-RTC sampler
 - vit_llm_only: Build only Qwen3-VL ViT + LLM engines
 - full_pipeline: Build engines for all pipeline components
   (ViT, LLM, VL Self-Attention, State Encoder, Action Encoder, DiT, Action Decoder)
+- prefix_rtc_full_pipeline_sampler: Build ViT, LLM, VL Self-Attention,
+  state encoder, and fused Prefix-RTC sampler
 
 Shape profiles are automatically derived from the ONNX models.
 
@@ -458,6 +461,14 @@ def build_full_pipeline(
         ("DiT", "dit_bf16.onnx", "dit_bf16.engine"),
         ("Action Decoder", "action_decoder.onnx", "action_decoder.engine"),
     ]
+    if component_names is not None and "Prefix-RTC Action Sampler" in component_names:
+        components.append(
+            (
+                "Prefix-RTC Action Sampler",
+                "prefix_rtc_action_sampler_bf16.onnx",
+                "prefix_rtc_action_sampler.engine",
+            )
+        )
     if component_names is not None:
         known_names = {name for name, _, _ in components}
         unknown_names = sorted(component_names - known_names)
@@ -561,7 +572,7 @@ class BuildConfig:
     """Configuration for building TensorRT engines from ONNX models."""
 
     mode: BuildEngineMode = BuildEngineMode.single
-    """Build mode: 'single', 'action_head', 'vit_llm_only' (ViT + LLM), or 'full_pipeline'."""
+    """Build mode: 'single', 'action_head', 'prefix_rtc_action_sampler', 'vit_llm_only', 'full_pipeline', or 'prefix_rtc_full_pipeline_sampler'."""
 
     onnx: str | None = None
     """Path to ONNX model (single mode)."""
@@ -587,12 +598,28 @@ def main(args: BuildConfig | None = None, trt_severity=None):
         args = tyro.cli(BuildConfig)
 
     build_mode = str(args.mode)
-    if build_mode in ("full_pipeline", "vit_llm_only", "action_head"):
+    if build_mode in (
+        "full_pipeline",
+        "vit_llm_only",
+        "action_head",
+        "prefix_rtc_action_sampler",
+        "prefix_rtc_full_pipeline_sampler",
+    ):
         component_names = None
         if build_mode == "vit_llm_only":
             component_names = {"ViT", "LLM"}
         elif build_mode == "action_head":
             component_names = {"State Encoder", "Action Encoder", "DiT", "Action Decoder"}
+        elif build_mode == "prefix_rtc_action_sampler":
+            component_names = {"State Encoder", "Prefix-RTC Action Sampler"}
+        elif build_mode == "prefix_rtc_full_pipeline_sampler":
+            component_names = {
+                "ViT",
+                "LLM",
+                "VL Self-Attention",
+                "State Encoder",
+                "Prefix-RTC Action Sampler",
+            }
         build_full_pipeline(
             onnx_dir=args.onnx_dir,
             engine_dir=args.engine_dir,

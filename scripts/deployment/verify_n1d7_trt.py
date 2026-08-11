@@ -101,7 +101,12 @@ def main(args: VerifyConfig | None = None):
     if args is None:
         args = tyro.cli(VerifyConfig)
     verify_mode = str(args.mode)
-    prefix_rtc_mode = verify_mode in ("prefix_rtc_action_head", "prefix_rtc_full_pipeline")
+    prefix_rtc_mode = verify_mode in (
+        "prefix_rtc_action_head",
+        "prefix_rtc_action_sampler",
+        "prefix_rtc_full_pipeline",
+        "prefix_rtc_full_pipeline_sampler",
+    )
 
     print("=" * 60)
     print("N1.7 TRT Action Head Verification")

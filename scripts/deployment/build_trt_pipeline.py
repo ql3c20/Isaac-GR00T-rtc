@@ -101,6 +101,16 @@ _MODE_MAP = {
         "prefix_rtc_full_pipeline",
         "prefix_rtc_full_pipeline",
     ),
+    "prefix_rtc_action_sampler": (
+        "prefix_rtc_action_sampler",
+        "prefix_rtc_action_sampler",
+        "prefix_rtc_action_sampler",
+    ),
+    "prefix_rtc_full_pipeline_sampler": (
+        "prefix_rtc_full_pipeline_sampler",
+        "prefix_rtc_full_pipeline_sampler",
+        "prefix_rtc_full_pipeline_sampler",
+    ),
     "full_pipeline": ("full_pipeline", "n17_full_pipeline", "n17_full_pipeline"),
     "action_head": ("action_head", "action_head", "dit_only"),
     "dit_only": ("single", "action_head", "dit_only"),
@@ -268,7 +278,7 @@ class PipelineConfig:
 
     # -- Export options ------------------------------------------------------
     export_mode: ExportMode = ExportMode.full_pipeline
-    """Export mode: 'vit_llm_only', 'dit_only', 'action_head', 'prefix_rtc_action_head', 'prefix_rtc_full_pipeline', or 'full_pipeline'."""
+    """Export mode: 'vit_llm_only', 'dit_only', 'action_head', 'prefix_rtc_action_head', 'prefix_rtc_action_sampler', 'prefix_rtc_full_pipeline', 'prefix_rtc_full_pipeline_sampler', or 'full_pipeline'."""
 
     prefix_rtc_timestep_mode: Optional[str] = None
     """Prefix-RTC timestep convention for RTC export modes."""

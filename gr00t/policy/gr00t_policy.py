@@ -21,6 +21,8 @@ This module provides the core policy classes for running Gr00t models:
 """
 
 from pathlib import Path
+import os
+import time
 from typing import Any
 
 import numpy as np
@@ -56,6 +58,18 @@ def _rec_to_dtype(x: Any, dtype: torch.dtype) -> Any:
         return [_rec_to_dtype(v, dtype) for v in x]
     else:
         return x
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+def _sync_for_timing(device: torch.device, enabled: bool) -> None:
+    if enabled and device.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize(device)
 
 
 class Gr00tPolicy(BasePolicy):
@@ -387,21 +401,50 @@ class Gr00tPolicy(BasePolicy):
         Returns:
             Tuple of (actions_dict, info_dict)
         """
+        return_timing = (
+            bool(options.get("return_timing"))
+            if options is not None and "return_timing" in options
+            else _env_flag("GR00T_RETURN_TIMING", False)
+        )
+        timing_sync_cuda = (
+            bool(options.get("timing_sync_cuda"))
+            if options is not None and "timing_sync_cuda" in options
+            else _env_flag("GR00T_TIMING_SYNC_CUDA", False)
+        )
+        timing: dict[str, float | dict[str, float]] | None = {} if return_timing else None
+        device = self.model.device
+
+        if timing is not None:
+            _sync_for_timing(device, timing_sync_cuda)
+            total_start = time.perf_counter()
+
         # Step 1: Split batched observation into individual observations
+        if timing is not None:
+            start = time.perf_counter()
         unbatched_observations = self._unbatch_observation(observation)
+        if timing is not None:
+            timing["unbatch_ms"] = (time.perf_counter() - start) * 1000.0
         processed_inputs = []
 
         # Step 2: Process each observation through the VLA processor
         states = []
+        if timing is not None:
+            start = time.perf_counter()
         for obs in unbatched_observations:
             vla_step_data = self._to_vla_step_data(obs)
             states.append(vla_step_data.states)  # dict[str, np.ndarray[np.float32, (T, D)]]
             messages = [{"type": MessageType.EPISODE_STEP.value, "content": vla_step_data}]
             processed_inputs.append(self.processor(messages))
+        if timing is not None:
+            timing["processor_ms"] = (time.perf_counter() - start) * 1000.0
 
         # Step 3: Collate processed inputs into a single batch for model
+        if timing is not None:
+            start = time.perf_counter()
         collated_inputs = self.collate_fn(processed_inputs)
         collated_inputs = _rec_to_dtype(collated_inputs, dtype=torch.bfloat16)
+        if timing is not None:
+            timing["collate_ms"] = (time.perf_counter() - start) * 1000.0
 
         # Step 3b: Real-Time Chunking (RTC) inpainting.
         # When the caller supplies the previous *normalized* action chunk plus RTC
@@ -411,8 +454,14 @@ class Gr00tPolicy(BasePolicy):
         # expects action_input["action"] in the model's internal normalized/padded
         # action space, i.e. exactly the tensor previously returned as
         # model_pred["action_pred"].
-        model_options: dict[str, Any] | None = None
+        model_options: dict[str, Any] = {}
+        if options is not None:
+            for key in ("return_timing", "timing_sync_cuda", "dit_cross_attn_kv_cache"):
+                if key in options:
+                    model_options[key] = options[key]
         if options is not None and options.get("rtc_prev_action") is not None:
+            if timing is not None:
+                start = time.perf_counter()
             prev_action = torch.as_tensor(
                 np.asarray(options["rtc_prev_action"], dtype=np.float32)
             )
@@ -420,25 +469,47 @@ class Gr00tPolicy(BasePolicy):
                 prev_action = prev_action.unsqueeze(0)  # (T, D) -> (1, T, D)
             prev_action = prev_action.to(device=self.model.device, dtype=torch.bfloat16)
             collated_inputs["inputs"]["action"] = prev_action
-            model_options = {
-                "action_horizon": int(options.get("action_horizon", prev_action.shape[1])),
-                "rtc_overlap_steps": int(options["rtc_overlap_steps"]),
-                "rtc_frozen_steps": int(options["rtc_frozen_steps"]),
-                "rtc_ramp_rate": float(options["rtc_ramp_rate"]),
-            }
+            model_options.update(
+                {
+                    "action_horizon": int(options.get("action_horizon", prev_action.shape[1])),
+                    "rtc_overlap_steps": int(options["rtc_overlap_steps"]),
+                    "rtc_frozen_steps": int(options["rtc_frozen_steps"]),
+                    "rtc_ramp_rate": float(options["rtc_ramp_rate"]),
+                }
+            )
+            if timing is not None:
+                timing["rtc_prepare_ms"] = (time.perf_counter() - start) * 1000.0
+        if return_timing:
+            model_options["return_timing"] = True
+            model_options["timing_sync_cuda"] = timing_sync_cuda
+        if "dit_cross_attn_kv_cache" not in model_options and _env_flag(
+            "GR00T_DIT_CROSS_ATTN_KV_CACHE", False
+        ):
+            model_options["dit_cross_attn_kv_cache"] = True
+        model_options_arg = model_options or None
 
         # Step 4: Run model inference to predict actions
+        if timing is not None:
+            _sync_for_timing(device, timing_sync_cuda)
+            start = time.perf_counter()
         with torch.inference_mode():
-            model_pred = self.model.get_action(**collated_inputs, options=model_options)
+            model_pred = self.model.get_action(**collated_inputs, options=model_options_arg)
+        if timing is not None:
+            _sync_for_timing(device, timing_sync_cuda)
+            timing["model_ms"] = (time.perf_counter() - start) * 1000.0
         normalized_action = model_pred["action_pred"].float()
 
         # Step 5: Decode actions from normalized space back to physical units
+        if timing is not None:
+            start = time.perf_counter()
         batched_states = {}
         for k in self.modality_configs["state"].modality_keys:
             batched_states[k] = np.stack([s[k] for s in states], axis=0)  # (B, T, D)
         unnormalized_action = self.processor.decode_action(
             normalized_action.cpu().numpy(), self.embodiment_tag, batched_states
         )
+        if timing is not None:
+            timing["decode_ms"] = (time.perf_counter() - start) * 1000.0
 
         # Cast all actions to float32 for consistency
         casted_action = {
@@ -447,6 +518,10 @@ class Gr00tPolicy(BasePolicy):
         # Expose the raw normalized prediction so RTC callers can retain it as the
         # continuity prefix for the next chunk.
         info = {"normalized_action_pred": normalized_action.detach().cpu().numpy()}
+        if timing is not None:
+            timing["model_internal"] = model_pred.get("timing", {})
+            timing["total_ms"] = (time.perf_counter() - total_start) * 1000.0
+            info["timing"] = timing
         return casted_action, info
 
     def check_action(self, action: dict[str, Any]) -> None:

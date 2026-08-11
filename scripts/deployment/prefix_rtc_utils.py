@@ -155,6 +155,7 @@ def _patched_dit_forward(
     timestep: Optional[torch.LongTensor] = None,
     encoder_attention_mask: Optional[torch.Tensor] = None,
     return_all_hidden_states: bool = False,
+    encoder_kv_cache: Optional[dict[int, tuple[torch.Tensor, torch.Tensor]]] = None,
 ):
     temb = self.timestep_encoder(timestep)
     hidden_states = hidden_states.contiguous()
@@ -177,6 +178,8 @@ def _patched_dit_forward(
                 encoder_hidden_states=encoder_hidden_states,
                 encoder_attention_mask=None,
                 temb=temb,
+                encoder_kv_cache=encoder_kv_cache,
+                encoder_kv_cache_key=idx,
             )
         all_hidden_states.append(hidden_states)
 
@@ -195,6 +198,7 @@ def _patched_alternate_vl_dit_forward(
     return_all_hidden_states: bool = False,
     image_mask: Optional[torch.Tensor] = None,
     backbone_attention_mask: Optional[torch.Tensor] = None,
+    encoder_kv_cache: Optional[dict[int, tuple[torch.Tensor, torch.Tensor]]] = None,
 ):
     assert image_mask is not None, "Image mask is required"
     temb = self.timestep_encoder(timestep)
@@ -226,6 +230,8 @@ def _patched_alternate_vl_dit_forward(
                 encoder_hidden_states=encoder_hidden_states,
                 encoder_attention_mask=curr_encoder_attention_mask,
                 temb=temb,
+                encoder_kv_cache=encoder_kv_cache,
+                encoder_kv_cache_key=idx,
             )
         all_hidden_states.append(hidden_states)
 
@@ -260,6 +266,8 @@ def _prefix_rtc_get_action_with_features(
     backbone_output: BatchFeature,
     action_input: BatchFeature,
     options: dict[str, Any] | None = None,
+    timing: dict[str, float] | None = None,
+    timing_sync_cuda: bool = False,
 ) -> BatchFeature:
     vl_embeds = backbone_features
     batch_size = vl_embeds.shape[0]

@@ -24,7 +24,8 @@ Measures component-wise timing for:
 - Action Head (DiT): Flow-matching diffusion model
 - E2E: Full end-to-end inference
 
-Supports five inference modes:
+Supports TensorRT modes for DiT-only, full pipeline, vit_llm_only, and
+Prefix-RTC action-head/sampler variants.
 1. PyTorch Eager: Standard PyTorch execution
 2. torch.compile: PyTorch 2.0+ JIT compilation with max-autotune
 3. TensorRT (DiT-only): Optimized DiT action head using TensorRT engine
@@ -603,7 +604,14 @@ def main(args: BenchmarkConfig | None = None):
             strict=True,
         )
 
-        if args.trt_mode in ("n17_full_pipeline", "vit_llm_only"):
+        if args.trt_mode in (
+            "n17_full_pipeline",
+            "vit_llm_only",
+            "prefix_rtc_action_head",
+            "prefix_rtc_action_sampler",
+            "prefix_rtc_full_pipeline",
+            "prefix_rtc_full_pipeline_sampler",
+        ):
             from trt_model_forward import setup_tensorrt_engines
 
             setup_tensorrt_engines(policy_trt, args.trt_engine_path, mode=args.trt_mode)

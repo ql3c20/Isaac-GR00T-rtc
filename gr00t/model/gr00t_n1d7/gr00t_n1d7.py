@@ -14,6 +14,8 @@
 # limitations under the License.
 
 import logging
+import os
+import time
 from typing import Any, Tuple
 
 import torch
@@ -33,6 +35,18 @@ from gr00t.model.modules.embodiment_conditioned_mlp import (
 
 
 logger = logging.getLogger(__name__)
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+def _sync_for_timing(device: torch.device, enabled: bool) -> None:
+    if enabled and device.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize(device)
 
 
 class Gr00tN1d7ActionHead(nn.Module):
@@ -319,7 +333,11 @@ class Gr00tN1d7ActionHead(nn.Module):
         }
 
     def _encode_features(
-        self, backbone_output: BatchFeature, action_input: BatchFeature
+        self,
+        backbone_output: BatchFeature,
+        action_input: BatchFeature,
+        timing: dict[str, float] | None = None,
+        timing_sync_cuda: bool = False,
     ) -> BatchFeature:
         """
         Encode features for the action head.
@@ -337,7 +355,14 @@ class Gr00tN1d7ActionHead(nn.Module):
                 - backbone_features: [B, seq_len, backbone_embedding_dim]
                 - state_features: [B, 1, input_embedding_dim]
         """
+        device = action_input.state.device
+        if timing is not None:
+            _sync_for_timing(device, timing_sync_cuda)
+            start = time.perf_counter()
         backbone_output = self.process_backbone_output(backbone_output)
+        if timing is not None:
+            _sync_for_timing(device, timing_sync_cuda)
+            timing["vl_self_attention_ms"] = (time.perf_counter() - start) * 1000.0
 
         # Get vision and language embeddings.
         vl_embeds = backbone_output.backbone_features
@@ -351,7 +376,13 @@ class Gr00tN1d7ActionHead(nn.Module):
         state = state.view(state.shape[0], 1, -1)
 
         # Embed state.
+        if timing is not None:
+            _sync_for_timing(device, timing_sync_cuda)
+            start = time.perf_counter()
         state_features = self.state_encoder(state, embodiment_id)
+        if timing is not None:
+            _sync_for_timing(device, timing_sync_cuda)
+            timing["state_encoder_ms"] = (time.perf_counter() - start) * 1000.0
 
         return BatchFeature(data={"backbone_features": vl_embeds, "state_features": state_features})
 
@@ -364,6 +395,8 @@ class Gr00tN1d7ActionHead(nn.Module):
         backbone_output: BatchFeature,
         action_input: BatchFeature,
         options: dict[str, Any] | None = None,
+        timing: dict[str, float] | None = None,
+        timing_sync_cuda: bool = False,
     ) -> BatchFeature:
         """
         Generate actions using the flow matching diffusion process.
@@ -387,6 +420,18 @@ class Gr00tN1d7ActionHead(nn.Module):
 
         dt = 1.0 / self.num_inference_timesteps
         vel_strength = torch.ones_like(actions)
+        use_dit_kv_cache = (
+            bool(options.get("dit_cross_attn_kv_cache"))
+            if options is not None and "dit_cross_attn_kv_cache" in options
+            else _env_flag("GR00T_DIT_CROSS_ATTN_KV_CACHE", False)
+        )
+        dit_encoder_kv_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] | None = (
+            {} if use_dit_kv_cache else None
+        )
+        if timing is not None:
+            timing["dit_kv_cache_enabled"] = float(use_dit_kv_cache)
+            _sync_for_timing(device, timing_sync_cuda)
+            sampler_start = time.perf_counter()
 
         if "action" in action_input:
             # If action in input when doing get action, it means we want to use RTC.
@@ -435,17 +480,28 @@ class Gr00tN1d7ActionHead(nn.Module):
             timesteps_tensor = torch.full(
                 size=(batch_size,), fill_value=t_discretized, device=device
             )
+            if timing is not None:
+                _sync_for_timing(device, timing_sync_cuda)
+                start = time.perf_counter()
             action_features = self.action_encoder(actions, timesteps_tensor, embodiment_id)
             # Add position embedding.
             if self.config.add_pos_embed:
                 pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
                 pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
                 action_features = action_features + pos_embs
+            if timing is not None:
+                _sync_for_timing(device, timing_sync_cuda)
+                timing["action_encoder_ms"] = timing.get("action_encoder_ms", 0.0) + (
+                    time.perf_counter() - start
+                ) * 1000.0
 
             # Join vision, language, state and action embedding along sequence dimension.
             sa_embs = torch.cat((state_features, action_features), dim=1)
 
             # Run model forward.
+            if timing is not None:
+                _sync_for_timing(device, timing_sync_cuda)
+                start = time.perf_counter()
             if self.config.use_alternate_vl_dit:
                 model_output = self.model(
                     hidden_states=sa_embs,
@@ -453,19 +509,37 @@ class Gr00tN1d7ActionHead(nn.Module):
                     timestep=timesteps_tensor,
                     image_mask=backbone_output.image_mask,
                     backbone_attention_mask=backbone_output.backbone_attention_mask,
+                    encoder_kv_cache=dit_encoder_kv_cache,
                 )
             else:
                 model_output = self.model(
                     hidden_states=sa_embs,
                     encoder_hidden_states=vl_embeds,
                     timestep=timesteps_tensor,
+                    encoder_kv_cache=dit_encoder_kv_cache,
                 )
+            if timing is not None:
+                _sync_for_timing(device, timing_sync_cuda)
+                timing["dit_ms"] = timing.get("dit_ms", 0.0) + (
+                    time.perf_counter() - start
+                ) * 1000.0
+                start = time.perf_counter()
             pred = self.action_decoder(model_output, embodiment_id)
+            if timing is not None:
+                _sync_for_timing(device, timing_sync_cuda)
+                timing["action_decoder_ms"] = timing.get("action_decoder_ms", 0.0) + (
+                    time.perf_counter() - start
+                ) * 1000.0
 
             pred_velocity = pred[:, -self.action_horizon :]
 
             # Update actions using euler integration.
             actions = actions + dt * pred_velocity * vel_strength
+
+        if timing is not None:
+            _sync_for_timing(device, timing_sync_cuda)
+            timing["sampler_ms"] = (time.perf_counter() - sampler_start) * 1000.0
+            timing["dit_kv_cache_entries"] = float(len(dit_encoder_kv_cache or {}))
 
         return BatchFeature(
             data={
@@ -497,15 +571,45 @@ class Gr00tN1d7ActionHead(nn.Module):
             BatchFeature containing:
                 - action_pred: [B, action_horizon, action_dim] predicted actions
         """
-        features = self._encode_features(backbone_output, action_input)
-        return self.get_action_with_features(
+        return_timing = (
+            bool(options.get("return_timing"))
+            if options is not None and "return_timing" in options
+            else _env_flag("GR00T_RETURN_TIMING", False)
+        )
+        timing_sync_cuda = (
+            bool(options.get("timing_sync_cuda"))
+            if options is not None and "timing_sync_cuda" in options
+            else _env_flag("GR00T_TIMING_SYNC_CUDA", False)
+        )
+        timing: dict[str, float] | None = {} if return_timing else None
+        device = action_input.state.device
+
+        if timing is not None:
+            _sync_for_timing(device, timing_sync_cuda)
+            start = time.perf_counter()
+        features = self._encode_features(
+            backbone_output,
+            action_input,
+            timing=timing,
+            timing_sync_cuda=timing_sync_cuda,
+        )
+        if timing is not None:
+            _sync_for_timing(device, timing_sync_cuda)
+            timing["encode_features_ms"] = (time.perf_counter() - start) * 1000.0
+
+        output = self.get_action_with_features(
             backbone_features=features.backbone_features,
             state_features=features.state_features,
             embodiment_id=action_input.embodiment_id,
             backbone_output=backbone_output,
             action_input=action_input,
             options=options,
+            timing=timing,
+            timing_sync_cuda=timing_sync_cuda,
         )
+        if timing is not None:
+            output["timing"] = timing
+        return output
 
     @property
     def device(self):
@@ -638,12 +742,50 @@ class Gr00tN1d7(PreTrainedModel):
         """
         Generate actions using the complete model.
         """
+        return_timing = (
+            bool(options.get("return_timing"))
+            if options is not None and "return_timing" in options
+            else _env_flag("GR00T_RETURN_TIMING", False)
+        )
+        timing_sync_cuda = (
+            bool(options.get("timing_sync_cuda"))
+            if options is not None and "timing_sync_cuda" in options
+            else _env_flag("GR00T_TIMING_SYNC_CUDA", False)
+        )
+        timing: dict[str, float] | None = {} if return_timing else None
+        device = self.device
+
         # Prepare inputs for backbone and action head
+        if timing is not None:
+            _sync_for_timing(device, timing_sync_cuda)
+            start = time.perf_counter()
         backbone_inputs, action_inputs = self.prepare_input(inputs)
+        if timing is not None:
+            _sync_for_timing(device, timing_sync_cuda)
+            timing["prepare_input_ms"] = (time.perf_counter() - start) * 1000.0
 
         # Forward through backbone
+        if timing is not None:
+            _sync_for_timing(device, timing_sync_cuda)
+            start = time.perf_counter()
         backbone_outputs = self.backbone(backbone_inputs)
-        action_outputs = self.action_head.get_action(backbone_outputs, action_inputs, options)
+        if timing is not None:
+            _sync_for_timing(device, timing_sync_cuda)
+            timing["backbone_ms"] = (time.perf_counter() - start) * 1000.0
+
+        action_options = dict(options or {})
+        if timing is not None:
+            action_options["return_timing"] = True
+            action_options["timing_sync_cuda"] = timing_sync_cuda
+            _sync_for_timing(device, timing_sync_cuda)
+            start = time.perf_counter()
+        action_outputs = self.action_head.get_action(backbone_outputs, action_inputs, action_options)
+        if timing is not None:
+            _sync_for_timing(device, timing_sync_cuda)
+            timing["action_head_ms"] = (time.perf_counter() - start) * 1000.0
+            action_timing = action_outputs.get("timing", {})
+            timing.update({f"action_head.{k}": v for k, v in action_timing.items()})
+            action_outputs["timing"] = timing
 
         return action_outputs
 
