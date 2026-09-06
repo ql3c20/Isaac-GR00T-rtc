@@ -83,8 +83,14 @@ VALID_STEPS = tuple(Step)
 
 # Mapping from export_mode -> (build mode, verify mode, benchmark trt_mode)
 _MODE_MAP = {
+    "vit_llm_only": ("vit_llm_only", "vit_llm_only", "vit_llm_only"),
     "full_pipeline": ("full_pipeline", "n17_full_pipeline", "n17_full_pipeline"),
-    "action_head": ("full_pipeline", "action_head", "dit_only"),
+    "prefix_rtc_full_pipeline": (
+        "prefix_rtc_full_pipeline",
+        "prefix_rtc_full_pipeline",
+        "n17_full_pipeline",
+    ),
+    "action_head": ("action_head", "action_head", "dit_only"),
     "dit_only": ("single", "action_head", "dit_only"),
 }
 
@@ -213,6 +219,9 @@ class PipelineConfig:
     model_path: str = ""
     """Path to the model checkpoint (required)."""
 
+    backbone_path: Optional[str] = None
+    """Optional local Cosmos/Qwen backbone directory."""
+
     dataset_path: str = "demo_data/libero_demo"
     """Path to the dataset (LeRobot format)."""
 
@@ -281,6 +290,7 @@ def _run_export(cfg: PipelineConfig, onnx_dir: str, embodiment_tag, log_fp) -> N
 
     export_cfg = ExportConfig(
         model_path=cfg.model_path,
+        backbone_path=cfg.backbone_path,
         dataset_path=cfg.dataset_path,
         embodiment_tag=embodiment_tag,
         output_dir=onnx_dir,
@@ -310,7 +320,7 @@ def _run_build(
         )
     else:
         build_cfg = BuildConfig(
-            mode="full_pipeline",
+            mode=build_mode,
             onnx_dir=onnx_dir,
             engine_dir=engine_dir,
             precision=cfg.precision,
@@ -326,6 +336,7 @@ def _run_verify(cfg: PipelineConfig, engine_dir: str, embodiment_tag, log_fp) ->
     _, verify_mode, _ = _MODE_MAP[cfg.export_mode]
     verify_cfg = VerifyConfig(
         model_path=cfg.model_path,
+        backbone_path=cfg.backbone_path,
         dataset_path=cfg.dataset_path,
         engine_dir=engine_dir,
         mode=verify_mode,
@@ -350,6 +361,7 @@ def _run_benchmark(cfg: PipelineConfig, engine_dir: str, embodiment_tag, log_fp)
 
     benchmark_cfg = BenchmarkConfig(
         model_path=cfg.model_path,
+        backbone_path=cfg.backbone_path,
         dataset_path=cfg.dataset_path,
         embodiment_tag=embodiment_tag.value,
         trt_engine_path=trt_engine_path,

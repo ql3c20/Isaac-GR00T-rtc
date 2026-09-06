@@ -15,6 +15,7 @@
 
 import math
 from typing import List, Optional, Tuple
+import warnings
 
 import numpy as np
 
@@ -46,12 +47,57 @@ def _build_decoder(video_path: str, decoder_kwargs: Optional[dict]):
     return video_decoder_cls(video_path, **kwargs)
 
 
+def _get_opencv_capture(video_path: str):
+    """Open a video with OpenCV when TorchCodec's FFmpeg runtime is unavailable."""
+    try:
+        import cv2
+    except ImportError as exc:
+        raise ImportError(
+            f"{_TORCHCODEC_INSTALL_HINT} OpenCV fallback is also unavailable."
+        ) from exc
+
+    capture = cv2.VideoCapture(video_path)
+    if not capture.isOpened():
+        capture.release()
+        raise RuntimeError(f"OpenCV could not open video: {video_path}")
+    return cv2, capture
+
+
+def _get_frames_by_indices_opencv(video_path: str, indices: list[int] | np.ndarray) -> np.ndarray:
+    """Decode exact frame indices as RGB/NHWC, matching TorchCodec's output."""
+    cv2, capture = _get_opencv_capture(video_path)
+    requested = np.asarray(indices, dtype=np.int64).reshape(-1)
+    if np.any(requested < 0):
+        capture.release()
+        raise IndexError(f"Negative frame index requested from {video_path}: {requested}")
+
+    frames_by_index = {}
+    try:
+        for index in sorted(set(requested.tolist())):
+            capture.set(cv2.CAP_PROP_POS_FRAMES, int(index))
+            ok, frame = capture.read()
+            if not ok:
+                raise IndexError(f"Could not decode frame {index} from {video_path}")
+            frames_by_index[index] = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    finally:
+        capture.release()
+    return np.stack([frames_by_index[int(index)] for index in requested])
+
+
 def get_frames_by_indices(
     video_path: str,
     indices: list[int] | np.ndarray,
     decoder_kwargs: Optional[dict] = None,
 ) -> np.ndarray:
-    decoder = _build_decoder(video_path, decoder_kwargs)
+    try:
+        decoder = _build_decoder(video_path, decoder_kwargs)
+    except ImportError:
+        warnings.warn(
+            "TorchCodec could not load; falling back to OpenCV video decoding.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return _get_frames_by_indices_opencv(video_path, indices)
     return decoder.get_frames_at(indices=indices).data.numpy()
 
 
@@ -69,7 +115,16 @@ def get_frames_by_timestamps(
     Returns:
         np.ndarray: Frames at the specified timestamps.
     """
-    decoder = _build_decoder(video_path, decoder_kwargs)
+    try:
+        decoder = _build_decoder(video_path, decoder_kwargs)
+    except ImportError:
+        cv2, capture = _get_opencv_capture(video_path)
+        fps = capture.get(cv2.CAP_PROP_FPS)
+        capture.release()
+        if not np.isfinite(fps) or fps <= 0:
+            raise RuntimeError(f"OpenCV could not determine FPS for video: {video_path}")
+        timestamps = np.asarray(timestamps, dtype=np.float64)
+        return _get_frames_by_indices_opencv(video_path, np.rint(timestamps * fps).astype(int))
 
     # https://docs.pytorch.org/torchcodec/stable/generated/torchcodec.decoders.VideoStreamMetadata.html#torchcodec.decoders.VideoStreamMetadata
     fps = decoder.metadata.average_fps
@@ -104,7 +159,24 @@ def get_all_frames(
     Returns:
         tuple[np.ndarray, np.ndarray]: Frames and timestamps.
     """
-    decoder = _build_decoder(video_path, decoder_kwargs)
+    try:
+        decoder = _build_decoder(video_path, decoder_kwargs)
+    except ImportError:
+        cv2, capture = _get_opencv_capture(video_path)
+        fps = capture.get(cv2.CAP_PROP_FPS)
+        frames = []
+        try:
+            while True:
+                ok, frame = capture.read()
+                if not ok:
+                    break
+                frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        finally:
+            capture.release()
+        if not frames:
+            raise RuntimeError(f"OpenCV decoded no frames from video: {video_path}")
+        timestamps = np.arange(len(frames), dtype=np.float64) / fps
+        return np.stack(frames), timestamps
     frames = decoder.get_frames_at(indices=range(len(decoder)))
     return frames.data.numpy(), frames.pts_seconds.numpy()
 

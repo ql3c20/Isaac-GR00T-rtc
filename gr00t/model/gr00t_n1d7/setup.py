@@ -129,15 +129,9 @@ class Gr00tN1d7Pipeline(ModelPipeline):
         # self.config.model and must be copied onto the live HF model.config
         # (action_head reads getattr(self.config, "train_rtc", ...)).
         model.config.train_rtc = bool(getattr(self.config.model, "train_rtc", False))
-        model.config.train_rtc_min_delay = int(
-            getattr(self.config.model, "train_rtc_min_delay", 0)
-        )
-        model.config.train_rtc_max_delay = int(
-            getattr(self.config.model, "train_rtc_max_delay", 8)
-        )
-        model.config.train_prefix_rtc = bool(
-            getattr(self.config.model, "train_prefix_rtc", False)
-        )
+        model.config.train_rtc_min_delay = int(getattr(self.config.model, "train_rtc_min_delay", 0))
+        model.config.train_rtc_max_delay = int(getattr(self.config.model, "train_rtc_max_delay", 8))
+        model.config.train_prefix_rtc = bool(getattr(self.config.model, "train_prefix_rtc", False))
         model.config.prefix_rtc_timestep_mode = str(
             getattr(self.config.model, "prefix_rtc_timestep_mode", "legacy_zero")
         )
@@ -189,12 +183,8 @@ class Gr00tN1d7Pipeline(ModelPipeline):
         if env_path:
             path = Path(env_path)
             if not path.is_file():
-                raise FileNotFoundError(
-                    f"GR00T_PREFIX_RTC_MODULE does not exist: {path}"
-                )
-            spec = importlib.util.spec_from_file_location(
-                "gr00t_n17_prefix_rtc", path
-            )
+                raise FileNotFoundError(f"GR00T_PREFIX_RTC_MODULE does not exist: {path}")
+            spec = importlib.util.spec_from_file_location("gr00t_n17_prefix_rtc", path)
             if spec is None or spec.loader is None:
                 raise RuntimeError(f"Could not load prefix-rtc module from {path}")
             module = importlib.util.module_from_spec(spec)
@@ -203,21 +193,24 @@ class Gr00tN1d7Pipeline(ModelPipeline):
             try:
                 module = importlib.import_module("gr00t_n17_prefix_rtc")
             except ImportError:
-                default = Path(
-                    os.environ.get(
-                        "PSI0_ROOT",
-                        "/pfs/pfs-oHNwH0/mnt/pfs/humanoid/yzh/Psi0",
+                default = (
+                    Path(
+                        os.environ.get(
+                            "PSI0_ROOT",
+                            "/pfs/pfs-oHNwH0/mnt/pfs/humanoid/yzh/Psi0",
+                        )
                     )
-                ) / "scripts" / "deploy" / "gr00t_n17_prefix_rtc.py"
+                    / "scripts"
+                    / "deploy"
+                    / "gr00t_n17_prefix_rtc.py"
+                )
                 if not default.is_file():
                     raise ImportError(
                         "train_prefix_rtc=True but gr00t_n17_prefix_rtc is not "
                         "importable. Set PYTHONPATH to Psi0/scripts/deploy, or "
                         f"GR00T_PREFIX_RTC_MODULE / PSI0_ROOT. Tried: {default}"
                     ) from None
-                spec = importlib.util.spec_from_file_location(
-                    "gr00t_n17_prefix_rtc", default
-                )
+                spec = importlib.util.spec_from_file_location("gr00t_n17_prefix_rtc", default)
                 if spec is None or spec.loader is None:
                     raise RuntimeError(f"Could not load prefix-rtc module from {default}")
                 module = importlib.util.module_from_spec(spec)

@@ -342,6 +342,9 @@ class BenchmarkConfig:
     model_path: str = "checkpoints/GR00T-N1.7-LIBERO/libero_10"
     """Path to model checkpoint (local path, e.g. checkpoints/GR00T-N1.7-LIBERO/libero_10)."""
 
+    backbone_path: str | None = None
+    """Optional local Cosmos/Qwen backbone directory."""
+
     dataset_path: str | None = None
     """Path to dataset. Defaults to demo_data/libero_demo."""
 
@@ -406,6 +409,7 @@ def main(args: BenchmarkConfig | None = None):
     print("Loading policy...")
     policy = Gr00tPolicy(
         model_path=args.model_path,
+        backbone_path=args.backbone_path,
         embodiment_tag=EmbodimentTag.resolve(args.embodiment_tag),
         device=device,
         strict=True,
@@ -534,6 +538,7 @@ def main(args: BenchmarkConfig | None = None):
 
         policy_compiled = Gr00tPolicy(
             model_path=args.model_path,
+            backbone_path=args.backbone_path,
             embodiment_tag=EmbodimentTag.resolve(args.embodiment_tag),
             device=device,
             strict=True,
@@ -592,6 +597,7 @@ def main(args: BenchmarkConfig | None = None):
 
         policy_trt = Gr00tPolicy(
             model_path=args.model_path,
+            backbone_path=args.backbone_path,
             embodiment_tag=EmbodimentTag.resolve(args.embodiment_tag),
             device=device,
             strict=True,

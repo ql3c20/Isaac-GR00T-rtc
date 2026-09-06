@@ -43,6 +43,9 @@ class VerifyConfig:
     model_path: str
     """Path to model checkpoint (required)."""
 
+    backbone_path: str | None = None
+    """Optional local Cosmos/Qwen backbone directory."""
+
     dataset_path: str = "demo_data/libero_demo"
     """Path to dataset."""
 
@@ -92,6 +95,7 @@ def main(args: VerifyConfig | None = None):
     policy = Gr00tPolicy(
         embodiment_tag=args.embodiment_tag,
         model_path=args.model_path,
+        backbone_path=args.backbone_path,
         device="cuda",
     )
 

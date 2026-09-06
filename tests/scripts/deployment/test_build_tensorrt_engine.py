@@ -50,6 +50,13 @@ _PIPELINE_ONNX_FILES = [
     "action_decoder.onnx",
 ]
 
+_ACTION_HEAD_ONNX_FILES = [
+    "state_encoder.onnx",
+    "action_encoder.onnx",
+    "dit_bf16.onnx",
+    "action_decoder.onnx",
+]
+
 
 @pytest.fixture
 def build_full_pipeline(monkeypatch):
@@ -133,6 +140,38 @@ def test_build_full_pipeline_returns_normally_when_all_engines_build(tmp_path, b
             engine_dir=str(engine_dir),
             precision="bf16",
         )
+
+
+def test_build_action_head_subset_does_not_require_backbone_onnx(tmp_path, build_full_pipeline):
+    """Action-head builds must not require ViT, LLM, or VL self-attention ONNX."""
+    onnx_dir = tmp_path / "onnx"
+    engine_dir = tmp_path / "engines"
+    onnx_dir.mkdir()
+    for filename in _ACTION_HEAD_ONNX_FILES:
+        (onnx_dir / filename).touch()
+
+    with (
+        patch("build_tensorrt_engine.derive_shapes_with_hint", return_value=({}, {}, {})),
+        patch("build_tensorrt_engine.build_engine", side_effect=_fake_build_engine_success),
+    ):
+        build_full_pipeline(
+            onnx_dir=str(onnx_dir),
+            engine_dir=str(engine_dir),
+            precision="bf16",
+            only_components={
+                "State Encoder",
+                "Action Encoder",
+                "DiT",
+                "Action Decoder",
+            },
+        )
+
+    assert {path.name for path in engine_dir.iterdir()} == {
+        "state_encoder.engine",
+        "action_encoder.engine",
+        "dit_bf16.engine",
+        "action_decoder.engine",
+    }
 
 
 def test_build_full_pipeline_raises_when_all_onnx_inputs_missing(tmp_path, build_full_pipeline):

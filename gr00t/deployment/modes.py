@@ -63,7 +63,9 @@ class ExportMode(_StrEnum):
 
     dit_only = enum.auto()
     action_head = enum.auto()
+    vit_llm_only = enum.auto()
     full_pipeline = enum.auto()
+    prefix_rtc_full_pipeline = enum.auto()
 
 
 class VerifyMode(_StrEnum):
@@ -71,6 +73,8 @@ class VerifyMode(_StrEnum):
 
     action_head = enum.auto()
     n17_full_pipeline = enum.auto()
+    prefix_rtc_action_head = enum.auto()
+    prefix_rtc_full_pipeline = enum.auto()
     vit_llm_only = enum.auto()
 
 
@@ -86,4 +90,7 @@ class BuildEngineMode(_StrEnum):
     """Allowed values for ``build_tensorrt_engine`` ``--mode``."""
 
     single = enum.auto()
+    action_head = enum.auto()
+    vit_llm_only = enum.auto()
     full_pipeline = enum.auto()
+    prefix_rtc_full_pipeline = enum.auto()

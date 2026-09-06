@@ -255,8 +255,7 @@ class Gr00tN1d7ActionHead(nn.Module):
                     dtype=torch.long,
                 )
                 rtc_prefix_mask = (
-                    torch.arange(actions.shape[1], device=actions.device)[None, :]
-                    < delays[:, None]
+                    torch.arange(actions.shape[1], device=actions.device)[None, :] < delays[:, None]
                 )
                 # Expose the clean prefix as the known/conditioned part.
                 noisy_trajectory = torch.where(
@@ -521,7 +520,7 @@ class Gr00tN1d7ActionHead(nn.Module):
 
 
 def get_backbone_cls(config: Gr00tN1d7Config):
-    if "nvidia/Cosmos-Reason2" in config.model_name or "Qwen/Qwen3-VL" in config.model_name:
+    if "Cosmos-Reason2" in config.model_name or "Qwen3-VL" in config.model_name:
         # We import here as Qwen3Backbone depends on newer transformers versions than the rest of the code.
         from gr00t.model.modules.qwen3_backbone import Qwen3Backbone
 

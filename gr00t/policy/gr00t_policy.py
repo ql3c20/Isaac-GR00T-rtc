@@ -25,7 +25,7 @@ from typing import Any
 
 import numpy as np
 import torch
-from transformers import AutoModel, AutoProcessor
+from transformers import AutoConfig, AutoModel, AutoProcessor
 
 from gr00t.data.embodiment_tags import FINETUNE_ONLY_TAGS, POSTTRAIN_TAGS, EmbodimentTag
 from gr00t.data.interfaces import BaseProcessor
@@ -78,6 +78,7 @@ class Gr00tPolicy(BasePolicy):
         *,
         device: int | str,
         strict: bool = True,
+        backbone_path: str | None = None,
     ):
         """Initialize the Gr00t Policy.
 
@@ -87,6 +88,9 @@ class Gr00tPolicy(BasePolicy):
             model_path: Path to the pretrained model checkpoint directory
             device: Device to run the model on (e.g., 'cuda:0', 0, 'cpu')
             strict: Whether to enforce strict input validation (default: True)
+            backbone_path: Optional local Cosmos/Qwen backbone directory. This
+                overrides the backbone identifier embedded in a transferred
+                checkpoint without modifying checkpoint metadata in place.
         """
         # Import this to register all models.
         import gr00t.model  # noqa: F401
@@ -97,7 +101,11 @@ class Gr00tPolicy(BasePolicy):
         model_dir = Path(model_path)
 
         # Load the pretrained model and move to target device with bfloat16 precision
-        model = AutoModel.from_pretrained(model_dir)
+        model_config = None
+        if backbone_path is not None:
+            model_config = AutoConfig.from_pretrained(model_dir)
+            model_config.model_name = str(backbone_path)
+        model = AutoModel.from_pretrained(model_dir, config=model_config)
         model.eval()  # Set model to evaluation mode
         model.to(device=device, dtype=torch.bfloat16)
         self.model = model
@@ -112,7 +120,10 @@ class Gr00tPolicy(BasePolicy):
             and not (model_dir / "processor_config.json").exists()
             else model_dir
         )
-        self.processor: BaseProcessor = AutoProcessor.from_pretrained(processor_dir)
+        processor_kwargs = {"model_name": str(backbone_path)} if backbone_path is not None else {}
+        self.processor: BaseProcessor = AutoProcessor.from_pretrained(
+            processor_dir, **processor_kwargs
+        )
         self.processor.eval()
 
         # Store embodiment-specific configurations
@@ -413,9 +424,7 @@ class Gr00tPolicy(BasePolicy):
         # model_pred["action_pred"].
         model_options: dict[str, Any] | None = None
         if options is not None and options.get("rtc_prev_action") is not None:
-            prev_action = torch.as_tensor(
-                np.asarray(options["rtc_prev_action"], dtype=np.float32)
-            )
+            prev_action = torch.as_tensor(np.asarray(options["rtc_prev_action"], dtype=np.float32))
             if prev_action.ndim == 2:
                 prev_action = prev_action.unsqueeze(0)  # (T, D) -> (1, T, D)
             prev_action = prev_action.to(device=self.model.device, dtype=torch.bfloat16)

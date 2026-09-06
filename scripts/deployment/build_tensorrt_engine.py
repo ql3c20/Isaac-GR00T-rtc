@@ -295,6 +295,9 @@ def build_engine(
     logger.info("Enabled DETAILED profiling verbosity for engine inspection")
 
     config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, workspace_mb * (1024**2))
+    if precision == "fp32" and hasattr(trt.BuilderFlag, "TF32"):
+        config.clear_flag(trt.BuilderFlag.TF32)
+        logger.info("Disabled TF32 tactics for strict FP32 accuracy")
 
     if use_strongly_typed:
         network_dtype_names: set[str] = set()
@@ -387,7 +390,13 @@ def build_engine(
 
 
 def build_full_pipeline(
-    onnx_dir, engine_dir, precision="bf16", workspace_mb=8192, trt_severity=None
+    onnx_dir,
+    engine_dir,
+    precision="bf16",
+    workspace_mb=8192,
+    trt_severity=None,
+    only_components=None,
+    prefix_rtc=False,
 ):
     """Build all TRT engines for the full pipeline.
 
@@ -429,6 +438,12 @@ def build_full_pipeline(
         )
 
     # Components: (name, onnx_file, engine_file)
+    action_encoder_onnx = "action_encoder_prefix_rtc.onnx" if prefix_rtc else "action_encoder.onnx"
+    action_encoder_engine = (
+        "action_encoder_prefix_rtc.engine" if prefix_rtc else "action_encoder.engine"
+    )
+    dit_onnx = "dit_prefix_rtc_bf16.onnx" if prefix_rtc else "dit_bf16.onnx"
+    dit_engine = "dit_prefix_rtc_bf16.engine" if prefix_rtc else "dit_bf16.engine"
     components = [
         # FP32 ViT preferred for accuracy; falls back to BF16 if only bf16 was
         # exported. Engine filename is precision-neutral (vit.engine) because
@@ -446,10 +461,12 @@ def build_full_pipeline(
         ("LLM", "llm_bf16.onnx", "llm_bf16.engine"),
         ("VL Self-Attention", "vl_self_attention.onnx", "vl_self_attention.engine"),
         ("State Encoder", "state_encoder.onnx", "state_encoder.engine"),
-        ("Action Encoder", "action_encoder.onnx", "action_encoder.engine"),
-        ("DiT", "dit_bf16.onnx", "dit_bf16.engine"),
+        ("Action Encoder", action_encoder_onnx, action_encoder_engine),
+        ("DiT", dit_onnx, dit_engine),
         ("Action Decoder", "action_decoder.onnx", "action_decoder.engine"),
     ]
+    if only_components is not None:
+        components = [component for component in components if component[0] in only_components]
 
     results: list[tuple[str, str, str]] = []
     skipped: list[tuple[str, str]] = []  # (name, onnx_path) for components with no ONNX input
@@ -567,13 +584,30 @@ def main(args: BuildConfig | None = None, trt_severity=None):
     if args is None:
         args = tyro.cli(BuildConfig)
 
-    if args.mode == "full_pipeline":
+    if args.mode in {
+        "action_head",
+        "full_pipeline",
+        "vit_llm_only",
+        "prefix_rtc_full_pipeline",
+    }:
+        only_components = None
+        if args.mode == "action_head":
+            only_components = {
+                "State Encoder",
+                "Action Encoder",
+                "DiT",
+                "Action Decoder",
+            }
+        elif args.mode == "vit_llm_only":
+            only_components = {"ViT", "LLM"}
         build_full_pipeline(
             onnx_dir=args.onnx_dir,
             engine_dir=args.engine_dir,
             precision=args.precision,
             workspace_mb=args.workspace,
             trt_severity=trt_severity,
+            only_components=only_components,
+            prefix_rtc=args.mode == "prefix_rtc_full_pipeline",
         )
     else:
         if not args.onnx or not args.engine:

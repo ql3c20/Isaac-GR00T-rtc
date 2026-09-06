@@ -49,6 +49,7 @@ Usage:
 
 import copy
 from dataclasses import dataclass
+import importlib.util
 import json
 import logging
 import os
@@ -1027,7 +1028,9 @@ def export_state_encoder_to_onnx(policy, output_dir, use_bf16=True, batch_size=1
 # ============================================================
 
 
-def export_action_encoder_to_onnx(policy, output_dir, use_bf16=True, batch_size=1):
+def export_action_encoder_to_onnx(
+    policy, output_dir, use_bf16=True, batch_size=1, prefix_rtc=False
+):
     """Export the action encoder (MultiEmbodimentActionEncoder) to ONNX.
 
     Input: actions [B, action_horizon, max_action_dim], timesteps [B], embodiment_id [B]
@@ -1046,14 +1049,16 @@ def export_action_encoder_to_onnx(policy, output_dir, use_bf16=True, batch_size=
     actions = torch.randn(
         batch_size, config.action_horizon, config.max_action_dim, dtype=dtype, device="cuda"
     )
-    timesteps = torch.zeros(batch_size, dtype=torch.int64, device="cuda")
+    timestep_shape = (batch_size, config.action_horizon) if prefix_rtc else (batch_size,)
+    timesteps = torch.zeros(timestep_shape, dtype=torch.int64, device="cuda")
     embodiment_id = torch.zeros(batch_size, dtype=torch.int64, device="cuda")
 
     logger.info(f"  actions: {actions.shape} ({actions.dtype})")
     logger.info(f"  timesteps: {timesteps.shape} ({timesteps.dtype})")
     logger.info(f"  embodiment_id: {embodiment_id.shape} ({embodiment_id.dtype})")
 
-    output_path = os.path.join(output_dir, "action_encoder.onnx")
+    filename = "action_encoder_prefix_rtc.onnx" if prefix_rtc else "action_encoder.onnx"
+    output_path = os.path.join(output_dir, filename)
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
     logger.info(f"  Exporting to {output_path}...")
@@ -1078,7 +1083,14 @@ def export_action_encoder_to_onnx(policy, output_dir, use_bf16=True, batch_size=
 # ============================================================
 
 
-def export_dit_to_onnx(policy, captured_inputs, output_path, use_bf16=True, batch_size=1):
+def export_dit_to_onnx(
+    policy,
+    captured_inputs,
+    output_path,
+    use_bf16=True,
+    batch_size=1,
+    prefix_rtc=False,
+):
     """Export the DiT (AlternateVLDiT) to ONNX.
 
     N1.7: image_mask and backbone_attention_mask are always present
@@ -1103,7 +1115,7 @@ def export_dit_to_onnx(policy, captured_inputs, output_path, use_bf16=True, batc
     # Use captured shapes but replace batch dim (index 0) with batch_size
     sa_shape = (batch_size,) + captured_inputs.sa_embs.shape[1:]
     vl_shape = (batch_size,) + captured_inputs.vl_embs.shape[1:]
-    ts_shape = (batch_size,)
+    ts_shape = (batch_size, sa_shape[1]) if prefix_rtc else (batch_size,)
 
     sa_embs = torch.randn(sa_shape, dtype=dtype, device="cuda")
     vl_embs = torch.randn(vl_shape, dtype=dtype, device="cuda")
@@ -1275,8 +1287,23 @@ def main(args):
     policy = Gr00tPolicy(
         embodiment_tag=args.embodiment_tag,
         model_path=args.model_path,
+        backbone_path=args.backbone_path,
         device="cuda",
     )
+    if args.export_mode == "prefix_rtc_full_pipeline":
+        module_path = Path(args.prefix_rtc_module_path)
+        spec = importlib.util.spec_from_file_location("gr00t_export_prefix_rtc", module_path)
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"Could not load prefix-RTC adapter: {module_path}")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        apply_prefix_rtc = getattr(module, "apply_prefix_rtc", None)
+        if not callable(apply_prefix_rtc):
+            raise RuntimeError(
+                f"Prefix-RTC adapter has no callable apply_prefix_rtc(): {module_path}"
+            )
+        apply_prefix_rtc(policy)
+        logger.info("  Applied prefix-RTC tensor-shape patches for ONNX export")
     logger.info("  Policy loaded")
 
     # Step 2: Load dataset
@@ -1295,12 +1322,16 @@ def main(args):
         dit_capture.hook_fn, with_kwargs=True
     )
 
-    # Also capture ViT and LLM inputs if doing full_pipeline
+    # Also capture ViT and LLM inputs when exporting either backbone mode.
     vit_capture = None
     vit_hook = None
     llm_capture = None
     llm_hook = None
-    if args.export_mode == "full_pipeline":
+    if args.export_mode in {
+        "vit_llm_only",
+        "full_pipeline",
+        "prefix_rtc_full_pipeline",
+    }:
         vit_capture = ViTInputCapture()
         qwen_model = policy.model.backbone.model
         vit_hook = qwen_model.model.visual.register_forward_hook(
@@ -1326,10 +1357,16 @@ def main(args):
     if not dit_capture.captured:
         logger.error("  Failed to capture DiT inputs!")
         return
-    if args.export_mode == "full_pipeline" and not vit_capture.captured:
+    if (
+        args.export_mode in {"vit_llm_only", "full_pipeline", "prefix_rtc_full_pipeline"}
+        and not vit_capture.captured
+    ):
         logger.error("  Failed to capture ViT inputs!")
         return
-    if args.export_mode == "full_pipeline" and not llm_capture.captured:
+    if (
+        args.export_mode in {"vit_llm_only", "full_pipeline", "prefix_rtc_full_pipeline"}
+        and not llm_capture.captured
+    ):
         logger.error("  Failed to capture LLM inputs!")
         return
 
@@ -1422,6 +1459,15 @@ def main(args):
         logger.info("\n--- [4d] Action Decoder ---")
         export_action_decoder_to_onnx(policy, args.output_dir, use_bf16=True, batch_size=bs)
 
+    elif args.export_mode == "vit_llm_only":
+        logger.info("\n[Step 4] Exporting ViT + LLM to ONNX...")
+
+        logger.info("\n--- [4a] ViT (Qwen3-VL Vision, FP32 for TRT accuracy) ---")
+        export_vit_to_onnx(policy, args.output_dir, vit_capture, use_bf16=False, batch_size=bs)
+
+        logger.info("\n--- [4b] LLM (Qwen3-VL Text Model) ---")
+        export_llm_to_onnx(policy, llm_capture, args.output_dir, use_bf16=True, batch_size=bs)
+
     elif args.export_mode == "full_pipeline":
         logger.info("\n[Step 4] Exporting full pipeline to ONNX...")
         logger.info("  (ViT TRT + LLM TRT + Action Head TRT)")
@@ -1464,6 +1510,47 @@ def main(args):
         logger.info("\n--- [4g] Action Decoder ---")
         export_action_decoder_to_onnx(policy, args.output_dir, use_bf16=True, batch_size=bs)
 
+    elif args.export_mode == "prefix_rtc_full_pipeline":
+        logger.info("\n[Step 4] Exporting prefix-RTC full pipeline to ONNX...")
+        logger.info("  (all heavy components TRT; per-token RTC timestep conditioning)")
+
+        logger.info("\n--- [4a] ViT (Qwen3-VL Vision, FP32 for TRT accuracy) ---")
+        export_vit_to_onnx(policy, args.output_dir, vit_capture, use_bf16=False, batch_size=bs)
+
+        logger.info("\n--- [4b] LLM (Qwen3-VL Text Model) ---")
+        export_llm_to_onnx(policy, llm_capture, args.output_dir, use_bf16=True, batch_size=bs)
+
+        logger.info("\n--- [4c] VL Self-Attention ---")
+        export_vl_self_attention_to_onnx(
+            policy, args.output_dir, vl_seq_len=vl_seq_len, use_bf16=True, batch_size=bs
+        )
+
+        logger.info("\n--- [4d] State Encoder ---")
+        export_state_encoder_to_onnx(policy, args.output_dir, use_bf16=True, batch_size=bs)
+
+        logger.info("\n--- [4e] Prefix-RTC Action Encoder ---")
+        export_action_encoder_to_onnx(
+            policy,
+            args.output_dir,
+            use_bf16=True,
+            batch_size=bs,
+            prefix_rtc=True,
+        )
+
+        logger.info("\n--- [4f] Prefix-RTC DiT ---")
+        dit_output_path = os.path.join(args.output_dir, "dit_prefix_rtc_bf16.onnx")
+        export_dit_to_onnx(
+            policy=policy,
+            captured_inputs=dit_capture,
+            output_path=dit_output_path,
+            use_bf16=True,
+            batch_size=bs,
+            prefix_rtc=True,
+        )
+
+        logger.info("\n--- [4g] Action Decoder ---")
+        export_action_decoder_to_onnx(policy, args.output_dir, use_bf16=True, batch_size=bs)
+
     # Summary
     logger.info("\n" + "=" * 80)
     logger.info("EXPORT COMPLETE!")
@@ -1487,6 +1574,9 @@ class ExportConfig:
     dataset_path: str
     """Path to the dataset (required, used to capture input shapes)."""
 
+    backbone_path: Optional[str] = None
+    """Optional local Cosmos/Qwen backbone directory."""
+
     embodiment_tag: Optional[EmbodimentTag] = None
     """Embodiment tag. If not provided, auto-detected from model's processor_config.json."""
 
@@ -1494,7 +1584,7 @@ class ExportConfig:
     """Output directory for ONNX models."""
 
     export_mode: ExportMode = ExportMode.dit_only
-    """Export mode: 'dit_only', 'action_head' (4 components), or 'full_pipeline' (ViT + action head)."""
+    """Export mode: 'dit_only', 'action_head', 'vit_llm_only', or 'full_pipeline'."""
 
     precision: Literal["bf16"] = "bf16"
     """Export precision for the generated ONNX graph.
@@ -1508,6 +1598,11 @@ class ExportConfig:
 
     batch_size: int = 1
     """Batch size baked into the exported ONNX models (default: 1)."""
+
+    prefix_rtc_module_path: str = (
+        "/home/ubuntu/yzh/Psi0_kimodo_textop/scripts/deploy/gr00t_n17_prefix_rtc.py"
+    )
+    """Prefix-RTC adapter used when exporting prefix_rtc_full_pipeline."""
 
 
 if __name__ == "__main__":
